@@ -884,49 +884,73 @@
                     </h3>
                     <span style="background: rgba(46, 204, 113, 0.1); color: #2ecc71; padding: 4px 12px; border-radius: 30px; font-size: 0.7rem; font-weight: bold; border: 1px solid #2ecc71; box-shadow: 0 0 10px rgba(46, 204, 113, 0.2);">
                         <i class="fas fa-check-circle"></i> SẴN SÀNG
-                    </h3>
+                    </span>
                 </div>
 
-                <div style="display: grid; 
-                            grid-template-columns: repeat(6, 1fr); 
-                            gap: 12px; 
-                            width: 100%;">
+                <div style="max-height: 400px; 
+                            overflow-y: auto; 
+                            padding-right: 5px;
+                            scrollbar-width: thin;
+                            scrollbar-color: #cbd5e1 #f1f5f9;">
                     
-                    {% set functions = [
-                        ('Lịch Đoàn công tác', 'fa-calendar-alt'), ('Danh sách chi nhánh', 'fa-building'), 
-                        ('Chấm công hàng tháng', 'fa-clock'), ('Theo dõi nghỉ phép', 'fa-calendar-check'), 
-                        ('Chấm công ngoài giờ', 'fa-user-clock'), ('Các ngày trong tháng', 'fa-calendar-day'),
-                        ('Trắc nghiệm Quiz', 'fa-vial'), ('Theo dõi Lớp học đào tạo', 'fa-chalkboard-teacher'), 
-                        ('Lương V1, V2...', 'fa-money-bill-wave'), ('Theo dõi Hồ sơ khen thưởng', 'fa-award'), 
-                        ('Báo cáo tùy chỉnh', 'fa-chart-pie'),
-                        ('Điền mẫu nhanh', 'fa-vial')
-                    ] %}
-
-                    {% for name, icon in functions %}
-                    <div style="padding: 10px 15px; 
-                                border-radius: 12px; 
-                                background: #f8f9fa; 
-                                border: 1px solid #eee; 
-                                display: flex; 
-                                justify-content: space-between; 
-                                align-items: center; 
-                                transition: var(--transition);
-                                cursor: pointer;
-                                min-height: 54px;" 
-                         onmouseover="this.style.transform='translateY(-2px)'; this.style.borderColor='#2ecc71'; this.style.background='#fff'; this.style.boxShadow='0 4px 12px rgba(46, 204, 113, 0.1)';"
-                         onmouseout="this.style.transform='translateY(0)'; this.style.borderColor='#eee'; this.style.background='#f8f9fa'; this.style.boxShadow='none';">
+                    <div style="display: grid; 
+                                grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); 
+                                gap: 12px; 
+                                width: 100%;">
                         
-                        <div style="display: flex; align-items: center; gap: 10px; flex: 1;">
-                            <div style="width: 32px; height: 32px; background: white; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid #f0f0f0;">
-                                <i class="fas {{ icon }}" style="color: #3498db; font-size: 0.85rem;"></i>
+                        {% set functions = [
+                            ('Lịch Đoàn công tác', 'fa-calendar-alt'), 
+                            ('Danh sách chi nhánh', 'fa-building'), 
+                            ('Chấm công hàng tháng', 'fa-clock'), 
+                            ('Theo dõi nghỉ phép', 'fa-calendar-check'), 
+                            ('Chấm công ngoài giờ', 'fa-user-clock'), 
+                            ('Các ngày trong tháng', 'fa-calendar-day'),
+                            ('Trắc nghiệm Quiz', 'fa-vial'), 
+                            ('Theo dõi Lớp học đào tạo', 'fa-chalkboard-teacher'), 
+                            ('Lương V1, V2...', 'fa-money-bill-wave'), 
+                            ('Theo dõi Hồ sơ khen thưởng', 'fa-award'), 
+                            ('Báo cáo tùy chỉnh', 'fa-chart-pie'),
+                            ('Điền mẫu nhanh', 'fa-vial'),
+                            ('Chuyển font .VnTime sang Times New Roman', 'fa-font'),
+                            ('Nạp TXT, CSV vào BC48', 'fa-file-upload'),
+                            ('Lỗi khi nạp TXT', 'fa-exclamation-triangle'),
+                            ('Nhật ký nạp TXT', 'fa-history'),
+                            ('Nhật ký nạp CSV', 'fa-clipboard-list'),
+                            ('Dashboard hình thức file (GLD; GBS; GLA)', 'fa-chart-bar'),
+                            ('Lỗi logic: LoaiKH, LoaiGT, KHCN (ngaysinh, sogt)', 'fa-user-shield'),
+                            ('Lỗi logic: Tỷ giá', 'fa-dollar-sign'),
+                            ('Lỗi logic: Danh mục dữ liệu', 'fa-folder-minus'),
+                            ('Tổng hợp BC48 toàn hàng & chi nhánh', 'fa-server'),
+                            ('Kết quả dò tìm lỗi (chi_tiet_loi_master) theo ma_giao_dich và KIỂM TRA GIAO DỊCH LỖI, ket_qua_do_tim_loi, giao_dich_error_khong_tim_thay', 'fa-search-minus'),
+                            ('Bóc tách mota_loi của CSV', 'fa-scissors')
+                        ] %}
+
+                        {% for name, icon in functions %}
+                        <div style="padding: 10px 15px; 
+                                    border-radius: 12px; 
+                                    background: #f8f9fa; 
+                                    border: 1px solid #eee; 
+                                    display: flex; 
+                                    justify-content: space-between; 
+                                    align-items: center; 
+                                    transition: var(--transition);
+                                    cursor: pointer;
+                                    min-height: 54px;" 
+                             onmouseover="this.style.transform='translateY(-2px)'; this.style.borderColor='#2ecc71'; this.style.background='#fff'; this.style.boxShadow='0 4px 12px rgba(46, 204, 113, 0.1)';"
+                             onmouseout="this.style.transform='translateY(0)'; this.style.borderColor='#eee'; this.style.background='#f8f9fa'; this.style.boxShadow='none';">
+                            
+                            <div style="display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;">
+                                <div style="width: 32px; height: 32px; background: white; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid #f0f0f0;">
+                                    <i class="fas {{ icon }}" style="color: #3498db; font-size: 0.85rem;"></i>
+                                </div>
+                                <span style="font-weight: 600; color: #444; font-size: 0.78rem; line-height: 1.2; word-break: break-word;">
+                                    {{ name }}
+                                </span>
                             </div>
-                            <span style="font-weight: 600; color: #444; font-size: 0.78rem; line-height: 1.2;">
-                                {{ name }}
-                            </span>
+                            <i class="fas fa-check-circle" style="color: #2ecc71; font-size: 0.75rem; flex-shrink: 0; margin-left: 5px;"></i>
                         </div>
-                        <i class="fas fa-check-circle" style="color: #2ecc71; font-size: 0.75rem; flex-shrink: 0;"></i>
+                        {% endfor %}
                     </div>
-                    {% endfor %}
                 </div>
             </div>
 
