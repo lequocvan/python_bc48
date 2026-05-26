@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="card shadow-sm mb-4 border-0 bg-light">
+        <div class="card-body py-4">
+            <!-- Form tích hợp toàn bộ bộ lọc và nút lệnh hành động -->
+            <form method="POST">
+                <div class="row align-items-center">
+                    <div class="col-md-4">
+                        <h3 class="mb-1"><i class="fas fa-paper-plane text-info"></i> Gửi Báo Cáo Lỗi CSV</h3>
+                        <p class="text-muted mb-0">Hệ thống sẽ quét dữ liệu lỗi và xử lý cho các chi nhánh.</p>
+                    </div>
+                    
+                    <!-- Khối bộ lọc điều kiện hỗ trợ tùy chọn TẤT CẢ -->
+                    <div class="col-md-5">
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label class="form-label small fw-bold text-muted mb-1">Loại báo cáo</label>
+                                <select class="form-select form-select-sm" name="loai_bc">
+                                    <option value="ALL">-- TẤT CẢ --</option>
+                                    {% for bc in loai_bc_list %}
+                                        <option value="{{ bc }}">{{ bc }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <div class="col-6">
+                                <div class="d-flex justify-content-between align-items-center mb-1">
+                                    <label class="form-label small fw-bold text-muted mb-0">Tháng/Năm kỳ BC</label>
+                                    <div class="form-check form-switch p-0 m-0" style="font-size: 0.75rem;">
+                                        <input class="form-check-input ms-0 me-1" type="checkbox" id="all_months" name="all_months" value="1" onchange="toggleMonthInput(this)">
+                                        <label class="form-check-label fw-bold text-secondary" for="all_months">Tất cả kỳ</label>
+                                    </div>
+                                </div>
+                                <input type="month" class="form-select form-select-sm" id="thang_nam_input" name="thang_nam" required 
+                                       value="{{ current_month if current_month else '' }}">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Các nút lệnh thực thi hành động gửi lên server -->
+                    <div class="col-md-3 text-end d-flex gap-2 justify-content-end pt-3 pt-md-0">
+                        <button type="submit" name="action" value="extract_only" class="btn btn-outline-secondary shadow-sm btn-action">
+                            <i class="fas fa-tools animate-icon"></i> <span class="btn-text">Chỉ bóc tách mota_loi của CSV</span>
+                        </button>
+                        <button type="submit" name="action" value="send_mail" class="btn btn-primary shadow btn-action">
+                            <i class="fas fa-envelope animate-icon"></i> <span class="btn-text">Bắt đầu gửi ngay</span>
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    {% if summary %}
+    <div class="card border-success shadow-sm mb-5">
+        <div class="card-header bg-success text-white">
+            <h5 class="mb-0"><i class="fas fa-check-double"></i> Kết quả lượt xử lý vừa xong</h5>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th class="text-center">Mã CN</th>
+                        <th>Email Nhận</th>
+                        <th class="text-center">Trạng thái</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for res in summary %}
+                    <tr>
+                        <td class="text-center"><b>{{ res.ma_cn }}</b></td>
+                        <td>{{ res.email }}</td>
+                        <td class="text-center">
+                            {% if res.status == 'Thành công' %}
+                                <span class="badge bg-success">Thành công</span>
+                            {% elif res.status == 'Thất bại' %}
+                                <span class="badge bg-danger">Thất bại</span>
+                            {% else %}
+                                <span class="badge bg-info text-dark">{{ res.status }}</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="card shadow border-0">
+        <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+            <h5 class="mb-0"><i class="fas fa-history text-warning"></i> Nhật ký gửi thư hệ thống (Ai gửi; Gửi lúc nào; Gửi cho ai)</h5>
+            <span class="badge rounded-pill bg-light text-dark">Trang {{ page }} / {{ total_pages }}</span>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-striped align-middle mb-0" style="font-size: 0.85rem;">
+                <thead class="table-secondary">
+                    <tr>
+                        <th>Thời gian gửi</th>
+                        <th>Đơn vị</th>
+                        <th>Email nhận</th>
+                        <th>File đính kèm</th>
+                        <th>Trạng thái</th>
+                        <th>Người gửi</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for log in history %}
+                    <tr>
+                        <td class="text-nowrap">{{ log.ngay_gui.strftime('%d/%m/%Y %H:%M:%S') }}</td>
+                        <td><span class="badge border text-dark">{{ log.ma_hieu_1 }}</span></td>
+                        <td>{{ log.email_nhan }}</td>
+                        <td>
+                            <span class="text-muted" title="{{ log.duong_dan_file }}">
+                                <i class="fas fa-file-csv text-success"></i> {{ log.ten_file_dinh_kem }}
+                            </span>
+                        </td>
+                        <td>
+                            {% if log.trang_thai == 'Thành công' %}
+                                <span class="text-success fw-bold"><i class="fas fa-check"></i> Thành công</span>
+                            {% else %}
+                                <span class="text-danger fw-bold"><i class="fas fa-times"></i> Thất bại</span>
+                            {% endif %}
+                        </td>
+                        <td><i class="far fa-user"></i> {{ log.nguoi_thuc_hien }}</td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="text-center py-5 text-muted">Chưa có dữ liệu nhật ký gửi thư.</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        {% if total_pages > 1 %}
+        <div class="card-footer bg-white py-3">
+            <nav>
+                <ul class="pagination pagination-sm justify-content-center mb-0">
+                    <li class="page-item {{ 'disabled' if page == 1 }}">
+                        <a class="page-link" href="{{ url_for('giaodien_gui_mail_chi_nhanh', page=page-1) }}">Trước</a>
+                    </li>
+
+                    {% for p in range(1, total_pages + 1) %}
+                        {% if p == 1 or p == total_pages or (p >= page - 2 and p <= page + 2) %}
+                            <li class="page-item {{ 'active' if p == page }}">
+                                <a class="page-link" href="{{ url_for('giaodien_gui_mail_chi_nhanh', page=p) }}">{{ p }}</a>
+                            </li>
+                        {% elif p == page - 3 or p == page + 3 %}
+                            <li class="page-item disabled"><span class="page-link">...</span></li>
+                        {% endif %}
+                    {% endfor %}
+
+                    <li class="page-item {{ 'disabled' if page == total_pages }}">
+                        <a class="page-link" href="{{ url_for('giaodien_gui_mail_chi_nhanh', page=page+1) }}">Sau</a>
+                    </li>
+                </ul>
+            </nav>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+    // Bắt sự kiện submit form để tránh double click và tạo cảm giác mượt mà
+    document.querySelector('form').addEventListener('submit', function(e) {
+        const activeSubmitButton = document.activeElement;
+        if (activeSubmitButton && activeSubmitButton.classList.contains('btn-action')) {
+            // Chờ một chút để submit form truyền đúng name/value action lên server trước khi disable
+            setTimeout(() => {
+                const icon = activeSubmitButton.querySelector('.animate-icon');
+                const textSpan = activeSubmitButton.querySelector('.btn-text');
+                
+                // Thay đổi icon thành spinner quay tròn
+                if(icon) {
+                    icon.className = "fas fa-spinner fa-spin me-1";
+                }
+                if(textSpan) {
+                    textSpan.innerText = "Đang xử lý...";
+                }
+                
+                // Khóa tất cả các nút hành động
+                document.querySelectorAll('.btn-action').forEach(btn => {
+                    btn.classList.add('disabled');
+                    btn.style.pointerEvents = 'none';
+                });
+            }, 50);
+        }
+    });
+    
+    function toggleMonthInput(checkbox) {
+        const monthInput = document.getElementById('thang_nam_input');
+        if (checkbox.checked) {
+            monthInput.disabled = true;
+            monthInput.removeAttribute('required');
+        } else {
+            monthInput.disabled = false;
+            monthInput.setAttribute('required', 'required');
+        }
+    }
+</script>
+
+<style>
+    .table-responsive { min-height: 350px; }
+    .pagination .page-link { border-radius: 4px; margin: 0 2px; color: #444; }
+    .pagination .page-item.active .page-link { background-color: #212529; border-color: #212529; }
+    .card { overflow: hidden; border-radius: 10px; }
+    .shadow-sm { box-shadow: 0 .125rem .25rem rgba(0,0,0,.075)!important; }
+</style>
+{% endblock %}

@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
+<link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/buttons/2.4.2/css/buttons.bootstrap5.min.css">
+
+<div class="container-fluid mt-4">
+    <h2 class="mb-4"><i class="fas fa-chart-pie text-success"></i> Dashboard Thống Kê Hình Thức File</h2>
+    
+    <div class="card shadow mb-4">
+        <div class="card-header bg-light">
+            <h6 class="margin-0 text-dark"><i class="fas fa-filter"></i> Bộ lọc tiêu chí nâng cao</h6>
+        </div>
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-md-3">
+                    <label class="form-label font-weight-bold">Lọc theo Tháng (YYYYMM):</label>
+                    <select id="filter_thang" class="form-select form-control">
+                        <option value="">-- Tất cả các tháng --</option>
+                        {% set danh_sach_thang = matrix | map(attribute='Thang') | unique | sort(reverse=True) %}
+                        {% for t in danh_sach_thang %}
+                            <option value="{{ t }}">{{ t }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label font-weight-bold">Lọc theo Loại Báo Cáo:</label>
+                    <select id="filter_loai" class="form-select form-control">
+                        <option value="">-- Tất cả các loại --</option>
+                        {% set danh_sach_loai = matrix | map(attribute='Loại Báo Cáo') | unique | sort %}
+                        {% for l in danh_sach_loai %}
+                            <option value="{{ l }}">{{ l }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label font-weight-bold">Từ ngày:</label>
+                    <input type="date" id="filter_tu_ngay" class="form-control">
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label font-weight-bold">Đến ngày:</label>
+                    <input type="date" id="filter_den_ngay" class="form-control">
+                </div>
+                <div class="col-md-2 d-flex align-items-end">
+                    <button type="button" id="btn_clear_filter" class="btn btn-secondary w-100">
+                        <i class="fas fa-undo"></i> Xóa bộ lọc
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-xl-8 col-lg-12 mb-4">
+            <div class="card shadow">
+                <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                    <h5 class="margin-0"><i class="fas fa-table"></i> Ma Trận Tổng Hợp</h5>
+                </div>
+                <div class="card-body table-responsive">
+                    <table id="tbl_matrix" class="table table-bordered table-striped width-100">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>Tháng</th>
+                                <th>Loại Báo Cáo</th>
+                                <th>Lần đầu (GLD)</th>
+                                <th>Gửi lại (GLA)</th>
+                                <th>Bổ sung (GBS)</th>
+                                <th>Chưa phân loại</th>
+                                <th>Tổng giao dịch</th>
+                                <th>Cập nhật cuối (Thoidiem)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in matrix %}
+                            <tr data-ngay="{{ row['NgayBaoCao'] }}">
+                                <td><strong>{{ row['Thang'] }}</strong></td>
+                                <td><span class="badge bg-secondary">{{ row['Loại Báo Cáo'] }}</span></td>
+                                <td class="text-end" data-order="{{ row['Lan dau (GLD)'] }}">{{ "{:,}".format(row['Lan dau (GLD)']) }}</td>
+                                <td class="text-end" data-order="{{ row['Gui lai (GLA)'] }}">{{ "{:,}".format(row['Gui lai (GLA)']) }}</td>
+                                <td class="text-end" data-order="{{ row['Bo sung (GBS)'] }}">{{ "{:,}".format(row['Bo sung (GBS)']) }}</td>
+                                <td class="text-end" data-order="{{ row['Chua phan loai'] }}">{{ "{:,}".format(row['Chua phan loai']) }}</td>
+                                <td class="table-info font-weight-bold text-end" data-order="{{ row['Tong Giao Dich'] }}">{{ "{:,}".format(row['Tong Giao Dich']) }}</td>
+                                <td class="text-center text-muted"><small>{{ row['CapNhatCuoi'] }}</small></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-xl-4 col-lg-12 mb-4">
+            <div class="card shadow">
+                <div class="card-header bg-success text-white">
+                    <h5 class="margin-0"><i class="fas fa-chart-bar"></i> Tỷ Lệ Đóng Góp Theo Loại</h5>
+                </div>
+                <div class="card-body table-responsive">
+                    <table id="tbl_ratio" class="table table-bordered table-hover width-100">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>Tháng</th>
+                                <th>Loại</th>
+                                <th>Hình Thức</th>
+                                <th>Tổng Số</th>
+                                <th>Tỷ Lệ</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in ratio %}
+                            <tr data-ngay="{{ row['NgayBaoCao'] }}">
+                                <td>{{ row['Thang'] }}</td>
+                                <td><span class="badge bg-light text-dark border">{{ row['Loại Báo Cáo'] }}</span></td>
+                                <td><strong>{{ row['Hinh Thuc Gui'] }}</strong></td>
+                                <td class="text-end" data-order="{{ row['Tong Số Giao Dich'] }}">{{ "{:,}".format(row['Tong So Giao Dich']) }}</td>
+                                <td class="text-center"><b class="text-danger">{{ row['Ty Le (%)'] }}%</b></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script type="text/javascript" src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.4.2/js/dataTables.buttons.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.bootstrap5.min.js"></script>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.html5.min.js"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/buttons/2.4.2/js/buttons.print.min.js"></script>
+
+<script>
+$(document).ready(function() {
+    // 1. Cấu hình bảng Ma trận tổng hợp
+    var tableMatrix = $('#tbl_matrix').DataTable({
+        "order": [[0, "desc"], [1, "asc"]],
+        "pageLength": 15,
+        "dom": '<"d-flex justify-content-between align-items-center mb-3"Bf>rtip',
+        "buttons": [
+            {
+                extend: 'excelHtml5',
+                text: '<i class="fas fa-file-excel"></i> Xuất Excel',
+                className: 'btn btn-success btn-sm me-2',
+                title: 'Bao_cao_ma_tran_hinh_thuc_file',
+                exportOptions: {
+                    orthogonal: 'export',
+                    format: {
+                        body: function (data, row, column, node) {
+                            if ($(node).attr('data-order')) {
+                                return $(node).attr('data-order');
+                            }
+                            return data;
+                        }
+                    }
+                }
+            }
+        ]
+    });
+
+    // 2. Cấu hình bảng Tỷ lệ đóng góp
+    var tableRatio = $('#tbl_ratio').DataTable({
+        "order": [[0, "desc"], [1, "asc"], [3, "desc"]],
+        "pageLength": 12,
+        "dom": '<"d-flex justify-content-between align-items-center mb-2"Bf>rtip',
+        "buttons": [
+            {
+                extend: 'excelHtml5',
+                text: '<i class="fas fa-file-excel"></i> Xuất Excel Tỷ Lệ',
+                className: 'btn btn-outline-success btn-sm',
+                title: 'Bao_cao_ty_le_dong_gop_hinh_thuc'
+            }
+        ]
+    });
+
+    // 3. THIẾT LẬP HÀM LỌC NÂNG CAO CHO DATATABLES (Custom Range Filter khoảng ngày)
+    $.fn.dataTable.ext.search.push(
+        function(settings, data, rowIdx) {
+            var minDateVal = $('#filter_tu_ngay').val().replace(/-/g, ""); // '2026-05-01' -> '20260501'
+            var maxDateVal = $('#filter_den_ngay').val().replace(/-/g, ""); // '2026-05-25' -> '20260525'
+            
+            // Trỏ trực tiếp vào thuộc tính của thẻ tr dòng hiện tại để đọc chuỗi YYYYMMDD
+            var ngayBaoCaoStr = $(settings.aoData[rowIdx].nTr).attr('data-ngay') || "";
+            
+            if (!ngayBaoCaoStr) return true;
+
+            var targetDateNum = parseInt(ngayBaoCaoStr, 10);
+            var minNum = minDateVal ? parseInt(minDateVal, 10) : 0;
+            var maxNum = maxDateVal ? parseInt(maxDateVal, 10) : 99991231;
+            
+            return (targetDateNum >= minNum && targetDateNum <= maxNum);
+        }
+    );
+
+    // 4. Lọc kết hợp liên hoàn khi thay đổi bất kỳ ô input tiêu chí nào
+    $('#filter_thang, #filter_loai, #filter_tu_ngay, #filter_den_ngay').on('change', function() {
+        var valThang = $('#filter_thang').val();
+        var valLoai = $('#filter_loai').val();
+
+        // Lọc chuỗi text cho cột Tháng (0) và cột Loại báo cáo (1)
+        tableMatrix.column(0).search(valThang).column(1).search(valLoai);
+        tableRatio.column(0).search(valThang).column(1).search(valLoai);
+        
+        // Kích hoạt vẽ lại dữ liệu kèm theo Custom Filter khoảng ngày
+        tableMatrix.draw();
+        tableRatio.draw();
+    });
+
+    // Nút Xóa bộ lọc nhanh
+    $('#btn_clear_filter').on('click', function() {
+        $('#filter_thang').val('');
+        $('#filter_loai').val('');
+        $('#filter_tu_ngay').val('');
+        $('#filter_den_ngay').val('');
+        
+        tableMatrix.search('').columns().search('').draw();
+        tableRatio.search('').columns().search('').draw();
+    });
+});
+</script>
+{% endblock %}

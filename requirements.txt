@@ -1,0 +1,53 @@
+# --- Core Framework & Web Server ---
+Flask
+Flask-Cors
+# gunicorn (Lưu ý: gunicorn không chạy được trên Windows, dùng Waitress hoặc chạy trực tiếp python app.py)
+python-dotenv
+Werkzeug
+
+# --- Database & Drivers ---
+Flask-SQLAlchemy
+SQLAlchemy
+PyMySQL
+mysql-connector-python
+
+# --- Security & Authentication ---
+Flask-Bcrypt
+bcrypt
+Flask-Login
+cryptography
+PyJWT
+pyHanko
+
+# --- Data Processing & Excel ---
+pandas
+openpyxl
+pytz
+python-dateutil  # <--- THÊM MỚI: Cần cho "relativedelta"
+tzdata  # <--- THÊM MỚI để hỗ trợ pandas trên Windows
+python-docx
+lxml
+# vietnam-pro-utils
+
+# --- Document Templating ---
+docxtpl
+jinja2
+markupsafe
+
+# --- Utilities ---
+# typing, dataclasses (Có sẵn trong Python 3.7+, không cần thiết phải ghi ở đây)
+colorama  # <--- THÊM MỚI: Cần cho Flask trên Windows
+watchdog  # <--- THÊM MỚI: Cần cho hệ thống FileHistory
+
+# --- Google Drive API (For Backups) ---
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+# --- Real-time Communication ---
+flask-socketio
+python-socketio
+python-engineio
+bidict
+h11
+eventlet>=0.33.0
