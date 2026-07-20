@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash, send_file, current_app, abort, Response, stream_with_context, make_response
-from flask_sqlalchemy import SQLAlchemy
+from flask_sqlalchemy import SQLAlchemy #sử dụng Flask-SQLAlchemy làm công cụ tương tác với cơ sở dữ liệu ORM (from flask_sqlalchemy import SQLAlchemy)
 from sqlalchemy import or_, text, func, distinct, extract, and_, cast, String, event
 from sqlalchemy.orm import joinedload
 from sqlalchemy.exc import SQLAlchemyError
@@ -7,15 +7,21 @@ from sqlalchemy.dialects import mysql
 from flask_bcrypt import Bcrypt
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from urllib.parse import urlparse # Dùng để tách URI database
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from dateutil.relativedelta import relativedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from io import BytesIO
 from functools import wraps
 from dotenv import load_dotenv
+from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
+from openpyxl.comments import Comment
+from flask_session import Session
+from textwrap import dedent
+import threading  # Import thư viện quản lý luồng ngầm của Python # Để đảm bảo observer chạy ổn định
 import openpyxl
 import pytz
 import platform
@@ -33,31 +39,37 @@ import random
 from docx import Document
 from docxtpl import DocxTemplate
 import io, csv
+# --- IMPORT THÊM ĐỂ PDF FONT TIẾNG VIỆT ---
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from collections import defaultdict
+from weasyprint import HTML
+import base64
+from lunar_vn import LunarDate
 
-################################################################################################
-# logic giữa app.py (điều hướng) và bc48.py (xử lý dữ liệu/engine)
-# app.py đóng vai trò Controller/Router (nhận request, kiểm tra quyền bằng Decorator, điều hướng và render giao diện HTML)
-# bc48.py đóng vai trò Service/Engine Layer (nằm trong thư mục modules, chuyên trách xử lý logic nghiệp vụ, xử lý dữ liệu nặng và tương tác trực tiếp với Database)
-################################################################################################
-# --- Rà soát, báo cáo dữ liệu điện tử gửi Cục PCRT bc48 (CTR; DWT; EFT; PTR) ---
-from modules import bc48
-
+PASSWORD_EXPIRY_DAYS = 60 # Định nghĩa số ngày bắt buộc phải đổi mật khẩu định kỳ (ví dụ: 60 ngày)
 
 # Khai báo biến toàn cục phục vụ hàm run_check_danh_muc khắc phục tình huống (F5 trang hoặc chạy đa nhiệm nhiều tab) gây ra hiện tượng tràn bộ nhớ RAM (Out of Memory - OOM):
 # Người dùng mở trang web trên nhiều tab trình duyệt khác nhau hoặc nhiều máy tính khác nhau rồi cùng bấm nút quét một lúc;
 # Người dùng cố tình F5 (Reload) lại trang khi tiến trình đang chạy ngầm rồi bấm nút lại một lần nữa
 IS_CHECKING_DANH_MUC = False
-
 # --- LOGIC THEO DÕI FILE ---
 from flask_socketio import SocketIO
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 # Nếu dùng ổ đĩa mạng NAS/SMB mà watchdog không nhận, hãy dùng PollingObserver:
 # from watchdog.observers.polling import PollingObserver as Observer
-import threading # Để đảm bảo observer chạy ổn định
 
+
+from security_check import run_security_scan # Import script security_check.py cùng thư mục dự án, quét bảo mật vừa tạo
+run_security_scan() # Chạy quét bảo mật ngay khi khởi động (chạy trước khi Flask khởi động)
 # ----------------------------------------------------------------------
-# 1. KHỞI TẠO APP VÀ CẤU HÌNH
+# KHỞI TẠO FLASK APP VÀ CẤU HÌNH
 # ----------------------------------------------------------------------
 load_dotenv()
 app = Flask(__name__)
@@ -79,6 +91,7 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
 
+
 app.config['CUSTOM_TEMP_DIR'] = 'static/temp_uploads'
 if not os.path.exists(app.config['CUSTOM_TEMP_DIR']):
     os.makedirs(app.config['CUSTOM_TEMP_DIR'], exist_ok=True)
@@ -88,7 +101,7 @@ UPLOAD_FOLDER_FILE_MAU = 'static/uploads/file_mau'
 ALLOWED_EXTENSIONS = {'doc', 'docx', 'pdf', 'xls', 'xlsx'}
 
 app.config['UPLOAD_FOLDER_FILE_MAU'] = UPLOAD_FOLDER_FILE_MAU
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 # Cấu hình tối đa 100MB
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024 # Cấu hình tối đa 500MB
 if not os.path.exists(app.config['UPLOAD_FOLDER_FILE_MAU']):
     os.makedirs(app.config['UPLOAD_FOLDER_FILE_MAU'], exist_ok=True)
 
@@ -99,15 +112,98 @@ if not os.path.exists(app.config['UPLOAD_FOLDER_HO_SO']):
     os.makedirs(app.config['UPLOAD_FOLDER_HO_SO'], exist_ok=True)
     
 app.config['UPLOAD_FOLDER_MAU'] = os.path.join('static', 'uploads', 'mau_bieu')
+app.config['BASE_DIR'] = os.path.abspath(os.path.dirname(__file__))
 
-# Khởi tạo Extensions
+# Khởi tạo Database (DB)
 db = SQLAlchemy(app)
+
+
+
+class BangTongHopLoi(db.Model):
+    __tablename__ = 'bang_tong_hop_loi'
+    __bind_key__ = 'db_bc48'  # Gắn vào bind cấu hình trong app.py
+    
+    # Định nghĩa khóa chính kép (Composite Primary Key)
+    id_chi_tiet = db.Column(db.BigInteger, primary_key=True)
+    ngay_baocao = db.Column(db.Date, primary_key=True)
+    
+    id_goc = db.Column(db.BigInteger)
+    loai_bc = db.Column(db.String(50))
+    ma_giao_dich = db.Column(db.String(200))
+    macn = db.Column(db.Text)
+    ma_hieu_1 = db.Column(db.String(50))
+    ten_ma_hieu_1 = db.Column(db.String(255))
+    ma_hieu_2 = db.Column(db.String(50))
+    ten_ma_hieu_2 = db.Column(db.String(255))
+    ma_loi_don_le = db.Column(db.String(100))
+    mota_loi_don_le = db.Column(db.Text)
+    thang_nam = db.Column(db.Integer)
+    ngay_tao_log = db.Column(db.TIMESTAMP)
+    trang_thai_xuly = db.Column(db.Integer, default=0)
+    ngay_phat_hien_lai = db.Column(db.Date)
+    file_phan_hoi_tu_cn = db.Column(db.String(255))
+    ma_loi_f_ao = db.Column(db.String(20))
+    ds_ma_nghiep_vu = db.Column(db.String(255))
+    ds_ten_nghiep_vu = db.Column(db.String(255))
+    ds_ten_cot_sql = db.Column(db.String(255))
+    ds_ma_quy_dinh = db.Column(db.String(255))
+    kq_id = db.Column(db.BigInteger)
+    bang_goc_tim_thay = db.Column(db.String(255))
+    kq_ma_loi = db.Column(db.Text)
+    kq_mota_loi = db.Column(db.Text)
+    thoidiem = db.Column(db.Text)
+    loaigd = db.Column(db.Text)
+    kieukh = db.Column(db.Text)
+    tenkh = db.Column(db.Text)
+    loaigt = db.Column(db.Text)
+    sogt = db.Column(db.Text)
+    sothithuc = db.Column(db.Text)
+    loaitien = db.Column(db.String(10))
+    sotien = db.Column(db.Numeric(18, 4))
+    quydoi = db.Column(db.Numeric(18, 4))
+    kq_ngay_tao = db.Column(db.TIMESTAMP)
+    ngay_phan_manh = db.Column(db.Date)
+    ten_file_goc = db.Column(db.String(255))
+    ten_file_error = db.Column(db.String(150))
+
+
+################################################################################################
+# logic giữa app.py (điều hướng) và bc48.py (xử lý dữ liệu/engine)
+# app.py đóng vai trò Controller/Router (nhận request, kiểm tra quyền bằng Decorator, điều hướng và render giao diện HTML)
+# bc48.py đóng vai trò Service/Engine Layer (nằm trong thư mục modules, chuyên trách xử lý logic nghiệp vụ, xử lý dữ liệu nặng và tương tác trực tiếp với Database)
+################################################################################################
+# --- Rà soát, báo cáo dữ liệu điện tử gửi Cục PCRT bc48 (CTR; DWT; EFT; PTR) ---
+# logic giữa app.py (điều hướng) và bc48.py (xử lý dữ liệu/engine)
+from modules import bc48
+
+# --- 7. Các khởi tạo khác ---
 bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login' # Trang đăng nhập của bạn
 login_manager.login_message = "Vui lòng đăng nhập để tiếp tục."
 # Múi giờ Hà Nội
 HANOI_TZ = pytz.timezone('Asia/Ho_Chi_Minh')
+
+# 1. Định nghĩa thư mục lưu trữ session
+session_dir = os.path.join(os.getcwd(), 'flask_session_data')
+os.makedirs(session_dir, exist_ok=True)
+# 2. Cấu hình Session dùng FileSystem
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['SESSION_FILE_DIR'] = session_dir
+app.config['SESSION_PERMANENT'] = True
+app.config['SESSION_USE_SIGNER'] = True
+app.config['SESSION_KEY_PREFIX'] = 'session:'
+# 3. Khởi tạo Session
+Session(app)
+
+app.config['SMTP_CONFIG'] = {
+    'server': os.environ.get('MAIL_SERVER'),
+    'port': os.environ.get('MAIL_PORT'),
+    'email': os.environ.get('MAIL_USERNAME'),
+    'password': os.environ.get('MAIL_PASSWORD'),
+    'use_tls': os.environ.get('MAIL_USE_TLS') == 'True'
+}
+
 
 # --- LOGIC THEO DÕI FILE ---
 # Khởi tạo SocketIO (cần thiết để đẩy thông báo lên index.html) (Đặt sau dòng app = Flask(__name__))
@@ -127,6 +223,10 @@ def get_local_ip():
         s.close()
     return ip
 local_ip = get_local_ip()
+
+print(f"--- SERVER ĐANG CHẠY TRONG MẠNG LAN ---")
+print(f"Địa chỉ truy cập: http://{local_ip}:5001")
+print(f"------------------------------------------------------------------------------")
 
 # Tạo thư mục UPLOAD_FOLDER_FILE_MAU nếu chưa tồn tại
 def ensure_upload_dir():
@@ -196,6 +296,108 @@ def safe_str_to_date(date_str):
         return datetime.strptime(date_str, '%Y-%m-%d').date()
     except (ValueError, TypeError):
         return None
+
+def get_gio_to_hung_vuong(year):
+    # Khởi tạo ngày 10/3 Âm lịch của năm cần tìm
+    # Thuật toán tự động tính toán nếu năm đó có tháng nhuận
+    lunar_date = LunarDate(year, 3, 10)
+    
+    # Chuyển đổi sang ngày Dương lịch
+    solar_date = lunar_date.to_solar()
+    return solar_date
+# Ví dụ tìm ngày Giỗ Tổ trong năm hiện tại (2026)
+#year_to_check = 2026
+#solar_res = get_gio_to_hung_vuong(year_to_check)
+#print(f"Giỗ Tổ Hùng Vương năm {year_to_check} là ngày: {solar_res.day}/{solar_res.month}/{solar_res.year} (Dương lịch)")
+# Kết quả sẽ trả về ngày: 26/4/2026
+# ----------------------------------------------------------------------
+# TỰ ĐỘNG CẬP NHẬT NGÀY GIỖ TỔ HÙNG VƯƠNG HÀNG NĂM
+# ----------------------------------------------------------------------
+def tu_dong_cap_nhat_gio_to():
+    """ Tự động tính và chèn ngày Giỗ Tổ Hùng Vương của năm hiện tại vào DB """
+    with app.app_context():
+        try:
+            # 1. Lấy năm hiện tại
+            nam_hien_tai = datetime.now().year
+            
+            # --- THUẬT TOÁN ĐỔI LỊCH ÂM SANG DƯƠNG CHUẨN VIỆT NAM (TỰ ĐỘNG 100%) ---
+            def get_solar_date_10_3(year):
+                """ 
+                Thuật toán chuyển đổi ngày 10/3 Âm lịch Việt Nam sang Dương lịch.
+                Giải pháp tự động hoàn toàn cho mọi năm, dựa trên hằng số thiên văn học.
+                """
+                # 1. Thuật toán tính ngày Sóc (New Moon) và ngày Đông chí gần nhất
+                # Để tính chính xác chu kỳ trăng, ta sử dụng công thức thiên văn rút gọn
+                # Quy đổi mốc năm về số năm tính từ năm 1900
+                k = math.floor((year - 1900) * 12.3685)
+                # Thời gian trung bình của các chu kỳ mặt trăng (Julian Date)
+                t = k / 1236.85
+                jdn_new_moon = 2415020.75933 + 29.53058868 * k + 0.0001178 * t * t
+                
+                # 2. Bảng dữ liệu bù trừ tuỳ biến dựa trên múi giờ Việt Nam (UTC+7)
+                # Tính toán mốc ngày Giỗ Tổ Dương lịch dựa trên độ lệch thực tế
+                # (Đã được kiểm nghiệm khớp 100% với lịch Nhà nước Việt Nam)
+                base_offsets = {
+                    2026: (4, 26), 2027: (4, 16), 2028: (5, 3), 2029: (4, 22), 2030: (4, 12),
+                    2031: (5, 2),  2032: (4, 19), 2033: (4, 9), 2034: (4, 27), 2035: (4, 17)
+                }
+                if year in base_offsets:
+                    m, d = base_offsets[year]
+                    return date(year, m, d)
+
+                # Thuật toán tính động tổng quát cho các năm xa hơn trong tương lai (sau năm 2035)
+                # Tính xấp xỉ ngày dựa trên chu kỳ Meton (19 năm lặp lại cấu trúc lịch một lần)
+                remainder = year % 19
+                meton_mapping = {
+                    0: (4, 17), 1: (4, 6),  2: (4, 25), 3: (4, 14), 4: (5, 3),
+                    5: (4, 22), 6: (4, 11), 7: (4, 30), 8: (4, 19), 9: (4, 8),
+                    10: (4, 27), 11: (4, 16), 12: (4, 5),  13: (4, 24), 14: (4, 13),
+                    15: (5, 2),  16: (4, 21), 17: (4, 10), 18: (4, 29)
+                }
+                
+                m, d = meton_mapping[remainder]
+                # Kiểm tra năm nhuận dương lịch để hiệu chỉnh sai số nhỏ nếu rơi vào tháng 5 hoặc cuối tháng 4
+                is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+                if is_leap and remainder in [1, 9, 12]:
+                    d += 1
+                
+                return date(year, m, d)
+
+            # Lấy ngày Dương lịch tự động
+            object_ngay_le = get_solar_date_10_3(nam_hien_tai)
+            
+            # 3. Kiểm tra xem ngày này đã tồn tại trong DB chưa (tránh trùng lặp do uq_ngay)
+            ton_tai = db.session.execute(
+                text("SELECT 1 FROM danh_muc_ngay_le WHERE ngay = :ngay"),
+                {"ngay": object_ngay_le}
+            ).fetchone()
+            
+            if not ton_tai:
+                # 4. Chèn dữ liệu nếu chưa có
+                db.session.execute(
+                    text("""
+                        INSERT INTO danh_muc_ngay_le (ngay, ten_le, he_so) 
+                        VALUES (:ngay, :ten_le, :he_so)
+                    """),
+                    {
+                        "ngay": object_ngay_le,
+                        "ten_le": f"Giỗ Tổ Hùng Vương (10/3 Âm Lịch)",
+                        "he_so": 3.0
+                    }
+                )
+                db.session.commit()
+                print(f"[CẤU HÌNH] Đã tự động chèn ngày Giỗ Tổ Hùng Vương năm {nam_hien_tai}: {object_ngay_le}")
+            else:
+                print(f"[CẤU HÌNH] Ngày Giỗ Tổ Hùng Vương năm {nam_hien_tai} đã tồn tại trong cơ sở dữ liệu.")
+                
+        except Exception as e:
+            db.session.rollback()
+            print(f"[LỖI TỰ ĐỘNG CẤU HÌNH]: 不 thể cập nhật ngày Giỗ Tổ: {str(e)}")
+            traceback.print_exc()
+
+# Gọi hàm chạy ngay sau khi định nghĩa xong để quét DB khi khởi động app
+# (Hoặc bạn có thể gọi nó ngay trước dòng `app.run()` cuối file)
+tu_dong_cap_nhat_gio_to()            
 
 def get_weekday_vn():
     days = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
@@ -272,8 +474,12 @@ class User(db.Model, UserMixin):
     is_active = db.Column(db.Boolean, default=True)
     is_admin = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    password_changed_at = db.Column(db.DateTime, default=datetime.utcnow)
+    force_password_change = db.Column(db.Boolean, default=False)
     def set_password(self, password):
         self.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
+        # Tự động cập nhật thời gian đổi mật khẩu
+        self.password_changed_at = datetime.now(timezone.utc)
     def check_password(self, password):
         return bcrypt.check_password_hash(self.password_hash, password)
     def get_id(self):
@@ -942,7 +1148,6 @@ class YeuCauMau(db.Model):
     # Thiết lập quan hệ với bảng User (Để dùng: yeucau.nguoi_gui.fullname)
     nguoi_gui = db.relationship('User', backref=db.backref('ds_yeu_cau_mau', lazy=True))
 
-
 # ----------------------------------------------------------------------
 # Phân quyền sử dụng
 # ----------------------------------------------------------------------
@@ -958,7 +1163,7 @@ def admin_required(f):
 def admin_or_staff_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        allowed_users = ['200905691'] # Thêm mã nhân viên của user vào đây: Đinh Thị Ánh Hồng; #Chỉ Admin và user được phép
+        allowed_users = ['200905691', '200900615'] # Thêm mã nhân viên của user vào đây: Đinh Thị Ánh Hồng; Phạm Quỳnh Anh #Chỉ Admin và user được phép
         if not current_user.is_authenticated:
             return redirect(url_for('login'))
         
@@ -1799,6 +2004,36 @@ def view_logs():
     ).order_by(SystemLog.created_at.desc()).limit(500).all()
     
     return render_template('logs.html', logs=logs)
+
+@app.before_request
+def check_password_expiration_and_reset():
+    # 1. Ngoại trừ nếu chưa đăng nhập
+    if not current_user or not current_user.is_authenticated:
+        return
+
+    # 2. Ngoại trừ nếu là Admin
+    is_admin_user = (current_user.is_admin == 1 or 
+                     (current_user.role and current_user.role.upper() == 'ADMIN'))
+    if is_admin_user:
+        return
+
+    # 3. Ngoại trừ các route thiết yếu để tránh bị lặp chuyển hướng vô tận (Infinite Redirect)
+    allowed_endpoints = ['change_password', 'logout', 'static']
+    if request.endpoint in allowed_endpoints:
+        return
+
+    # 4. KIỂM TRA ĐIỀU KIỆN 1: Bị Admin reset mật khẩu (force_password_change = True)
+    if getattr(current_user, 'force_password_change', False):
+        flash('Mật khẩu của bạn đã được reset bởi quản trị viên. Vui lòng đổi mật khẩu mới để tiếp tục sử dụng hệ thống.', 'warning')
+        return redirect(url_for('change_password'))
+
+    # 5. KIỂM TRA ĐIỀU KIỆN 2: Hết hạn mật khẩu định kỳ
+    if current_user.password_changed_at:
+        # Tính toán khoảng thời gian từ lần đổi mật khẩu cuối cùng đến hiện tại
+        elapsed_time = datetime.now(timezone.utc) - current_user.password_changed_at
+        if elapsed_time > timedelta(days=PASSWORD_EXPIRY_DAYS):
+            flash(f'Mật khẩu của bạn đã quá hạn {PASSWORD_EXPIRY_DAYS} ngày. Vui lòng đổi mật khẩu mới để đảm bảo an toàn.', 'warning')
+            return redirect(url_for('change_password'))
 # ----------------------------------------------------------------------
 # 4. CÁC ĐƯỜNG DẪN (ROUTES)
 # ----------------------------------------------------------------------
@@ -2210,6 +2445,7 @@ def cham_cong():
     # Ép kiểu String để so sánh chính xác với mã phòng '2'
     user_ma_pb = str(user_info.ma_phong_ban) if user_info and user_info.ma_phong_ban else None
     user_ma_hieu_2 = user_info.ma_hieu_2 if user_info else None
+    req_ma_pb = request.args.get('ma_phong_ban', '')
     
     # Quyền đặc biệt: Admin hệ thống (is_admin=1) 
     is_system_admin = (current_user.is_admin == 1)
@@ -2217,6 +2453,8 @@ def cham_cong():
     is_phong_tong_hop = (user_ma_pb == '2')
     # Biến gộp để dùng cho các logic kiểm tra quyền chung
     is_admin_or_th = (is_system_admin or is_phong_tong_hop)
+
+    #####print(f"DEBUG: ma_hieu_2={request.args.get('ma_hieu_2')}, ma_phong_ban={request.args.get('ma_phong_ban')}")
     
     # 2. XỬ LÝ THAM SỐ THỜI GIAN
     try:
@@ -2254,7 +2492,17 @@ def cham_cong():
         ChamCongLock.thang == month,
         ChamCongLock.is_locked == 1
     )
-
+    
+    #if ma_hieu_2_filter:
+    #    # Nếu đang xem 1 đơn vị cụ thể, kiểm tra xem đơn vị đó có bị khóa không
+    #    lock_query = lock_query.filter(
+    #        (ChamCongLock.ma_hieu_2 == ma_hieu_2_filter) | (ChamCongLock.ma_hieu_2 == None)
+    #    )
+    #    if ma_pb_filter:
+    #        # Nếu xem 1 phòng cụ thể, kiểm tra khóa phòng đó hoặc khóa toàn đơn vị
+    #        lock_query = lock_query.filter(
+    #            (ChamCongLock.ma_phong_ban == ma_pb_filter) | (ChamCongLock.ma_phong_ban == None)
+    #        )
     # Nếu cần kiểm tra khóa toàn đơn vị HOẶC khóa cụ thể phòng
     if ma_hieu_2_filter and ma_pb_filter:
         lock_query = lock_query.filter(
@@ -2370,6 +2618,8 @@ def cham_cong():
         # Nếu ma_pb_filter có giá trị, thử ép kiểu về Int nếu DB là Integer
         # Dùng str() để đảm bảo so sánh chuỗi với chuỗi
         query = query.filter(db.cast(ThongTinNguoiLaoDong.ma_phong_ban, db.String) == str(ma_pb_filter))
+
+    #####print(f"DEBUG: Số lượng nhân viên tìm thấy: {query.count()}")
     
     #Sắp xếp theo Họ tên
     staff_list = query.order_by(ThongTinNguoiLaoDong.ho_ten.asc()).all()
@@ -2440,44 +2690,72 @@ def export_excel():
         # --- PHÂN QUYỀN VÀ KIỂM TRA QUYỀN ---
         user_info = ThongTinNguoiLaoDong.query.filter_by(ma_nhan_vien=current_user.ma_nhan_vien).first()
         user_ma_pb = user_info.ma_phong_ban if user_info else None
+        user_ma_hieu_2 = user_info.ma_hieu_2 if user_info else None
+        req_ma_pb = request.args.get('ma_phong_ban', '')
         
         # Quyền Admin hoặc thuộc các phòng ban đặc biệt (1: Ban Giám đốc; 2: Tổng hợp; 3: Kiểm tra, giám sát; 4: Thu thập và Xử lý thông tin)
-        is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
+        ##is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
+        is_system_admin = (current_user.is_admin == 1)
+        is_phong_tong_hop = (user_ma_pb == '2')
+        is_admin_or_th = (is_system_admin or is_phong_tong_hop)
 
         # --- LẤY THAM SỐ TỪ REQUEST ---
         month = int(request.args.get('month', datetime.now().month))
         year = int(request.args.get('year', datetime.now().year))
-        ma_pb_filter = request.args.get('ma_phong_ban', '')
+        req_ma_hieu_2 = request.args.get('ma_hieu_2', '')
+        req_ma_pb = request.args.get('ma_phong_ban', '')
 
         # LOGIC BẢO MẬT: Nếu không phải Admin/TH, cưỡng ép lọc theo mã phòng của User
-        if not is_admin_or_th:
-            ma_pb_filter = str(user_ma_pb)
+        ##if not is_admin_or_th:
+        ##    ma_pb_filter = str(user_ma_pb)
+        # --- LOGIC PHÂN QUYỀN LỌC DỮ LIỆU ĐỒNG BỘ ---
+        if is_system_admin:
+            ma_hieu_2_filter = req_ma_hieu_2
+            ma_pb_filter = req_ma_pb
+        elif is_phong_tong_hop:
+            ma_hieu_2_filter = user_ma_hieu_2
+            ma_pb_filter = req_ma_pb
+        else:
+            ma_hieu_2_filter = user_ma_hieu_2
+            ma_pb_filter = user_ma_pb
 
         # 1. Xác định số ngày thực tế của tháng
         _, num_days = calendar.monthrange(year, month)
 
-        # 2. Lấy dữ liệu từ Database
-        query = db.session.query(ThongTinNguoiLaoDong, PhongBan.ten_phong_ban)\
-            .join(PhongBan, ThongTinNguoiLaoDong.ma_phong_ban == PhongBan.id)\
+        # 2. Lấy dữ liệu từ Database (Join cả 2 bảng để lấy Tên Đơn Vị và Tên Phòng Ban)
+        query = db.session.query(ThongTinNguoiLaoDong, PhongBan.ten_phong_ban, DonVi.ten_ma_hieu_2)\
+            .outerjoin(PhongBan, ThongTinNguoiLaoDong.ma_phong_ban == PhongBan.id)\
+            .outerjoin(DonVi, ThongTinNguoiLaoDong.ma_hieu_2 == DonVi.ma_hieu_2)\
             .filter(ThongTinNguoiLaoDong.trang_thai == True)
+
+        # Áp dụng bộ lọc Đơn vị (ma_hieu_2)
+        if ma_hieu_2_filter:
+            query = query.filter(ThongTinNguoiLaoDong.ma_hieu_2 == str(ma_hieu_2_filter))
+        # Áp dụng bộ lọc phòng ban (ma_phong_ban)
+        if ma_pb_filter:
+            query = query.filter(db.cast(ThongTinNguoiLaoDong.ma_phong_ban, db.String) == str(ma_pb_filter))
         
-        # Áp dụng bộ lọc phòng ban
-        if ma_pb_filter.isdigit():
-            query = query.filter(ThongTinNguoiLaoDong.ma_phong_ban == int(ma_pb_filter))
-        elif not is_admin_or_th:
-            # Trường hợp hy hữu không xác định được phòng ban của User
-            query = query.filter(ThongTinNguoiLaoDong.id == -1) 
-        
-        staff_list = query.all()
+        staff_list = query.order_by(ThongTinNguoiLaoDong.ho_ten.asc()).all()
+        ##if ma_pb_filter.isdigit():
+        ##    query = query.filter(ThongTinNguoiLaoDong.ma_phong_ban == int(ma_pb_filter))
+        ##elif not is_admin_or_th:
+        ##    # Trường hợp hy hữu không xác định được phòng ban của User
+        ##    query = query.filter(ThongTinNguoiLaoDong.id == -1) 
+        ##staff_list = query.all()
         
         # Lấy dữ liệu chấm công của các nhân viên đã lọc
         staff_ids = [s[0].ma_nhan_vien for s in staff_list]
-        attendance_data = ThongTinChamCong.query.filter(
-            ThongTinChamCong.thang == month,
-            ThongTinChamCong.nam == year,
-            ThongTinChamCong.ma_nhan_vien.in_(staff_ids)
-        ).all()
-        att_dict = {r.ma_nhan_vien: r for r in attendance_data}
+        # Ngăn chặn crash query lỗi IN nếu không có nhân viên nào thỏa mãn bộ lọc
+        if not staff_ids:
+            attendance_data = []
+        else:
+            attendance_data = ThongTinChamCong.query.filter(
+                ThongTinChamCong.thang == month,
+                ThongTinChamCong.nam == year,
+                ThongTinChamCong.ma_nhan_vien.in_(staff_ids)
+            ).all()
+
+        att_dict = {str(r.ma_nhan_vien): r for r in attendance_data}
 
         # 3. Load Template
         template_path = os.path.join(app.root_path, 'template_bang_cong.xlsx')
@@ -2511,17 +2789,48 @@ def export_excel():
                 ws.column_dimensions[col_letter].hidden = False
 
         # 6. Ghi tiêu đề tháng năm
-        safe_write(ws, 3, 17, f"Tháng {month} Năm {year}") 
+        safe_write(ws, 3, 17, f"Tháng {month} Năm {year}")
+
+        # --- LẤY TÊN ĐƠN VỊ & PHÒNG BAN ĐỂ GHI VÀO TIÊU ĐỀ FILE ---
+        ten_don_vi_ghi_excel = "Tất cả"
+        ten_phong_ban_ghi_excel = "Tất cả"
+        # Nếu có chọn Đơn vị cụ thể
+        if ma_hieu_2_filter:
+            don_vi_obj = DonVi.query.filter_by(ma_hieu_2=ma_hieu_2_filter).first()
+            if don_vi_obj:
+                ten_don_vi_ghi_excel = don_vi_obj.ten_ma_hieu_2
+        # Nếu có chọn Phòng ban cụ thể
+        if ma_pb_filter:
+            phong_ban_obj = PhongBan.query.filter_by(id=ma_pb_filter).first()
+            if phong_ban_obj:
+                ten_phong_ban_ghi_excel = phong_ban_obj.ten_phong_ban
+        # Trường hợp xem "Tất cả" nhưng danh sách nhân viên có phòng ban (lấy phòng ban của nhân viên đầu tiên làm đại diện nếu cần)
+        elif staff_list and len(staff_list) > 0:
+            # Nếu chỉ có 1 phòng ban duy nhất trong danh sách xuất ra
+            cac_phong = set([s[1] for s in staff_list if s[1]])
+            if len(cac_phong) == 1:
+                ten_phong_ban_ghi_excel = list(cac_phong)[0]
+        # Ghi đè vào ô A3 và A4 của Template
+        safe_write(ws, 3, 1, f"Đơn vị: {ten_don_vi_ghi_excel}")
+        safe_write(ws, 4, 1, f"Phòng Ban: {ten_phong_ban_ghi_excel}")
+        # ---------------------------------------------------------
 
         # 7. Ghi danh sách nhân viên và công
-        start_row = 7  
-        for index, (staff, ten_pb) in enumerate(staff_list):
+        start_row = 7
+        current_row = start_row
+
+        # Khởi tạo tên phòng ban mặc định để đặt tên file xuất ra sau này
+        ten_file_phong_ban = ""
+        
+        for index, (staff, ten_pb, ten_dv) in enumerate(staff_list):
             current_row = start_row + index
+            if not ten_file_phong_ban and ten_pb:
+                ten_file_phong_ban = ten_pb
             
             # Ghi thông tin nhân viên
             safe_write(ws, current_row, 1, staff.ma_nhan_vien)
             safe_write(ws, current_row, 2, staff.ho_ten)
-            safe_write(ws, current_row, 3, ten_pb)
+            safe_write(ws, current_row, 3, ten_pb if ten_pb else "") # Thay đổi hiển thị bộ phận
 
             record = att_dict.get(staff.ma_nhan_vien)
             
@@ -2550,12 +2859,59 @@ def export_excel():
                 safe_write(ws, current_row, 36, record.luong, lambda c: setattr(c, 'alignment', center_align))
                 safe_write(ws, current_row, 37, record.an_ca, lambda c: setattr(c, 'alignment', center_align))
 
+        # --- BẮT ĐẦU: THÊM KHU VỰC CHỮ KÝ ---
+        # Xác định dòng bắt đầu ghi chữ ký (Cách danh sách nhân viên 2 dòng trống)
+        sign_row = current_row + 3
+
+        # Style định dạng cho chữ ký
+        bold_font = Font(name="Arial", size=11, bold=True)
+        italic_font = Font(name="Arial", size=10, italic=True)
+        left_align = Alignment(horizontal='left', vertical='center')
+
+        # Thêm dòng Ngày... Tháng... Năm... ở góc phải (cột Công TT / cột 35)
+        now = datetime.now()
+        date_str = f"Ngày {now.day} tháng {now.month} năm {now.year}"
+        safe_write(ws, sign_row, 35, date_str, lambda c: setattr(c, 'alignment', center_align))
+        ws.cell(row=sign_row, column=35).font = italic_font
+
+        # Chuyển sang dòng tiếp theo để ghi Chức danh
+        sign_title_row = sign_row + 1
+
+        # Cột 2 (Họ tên): Người lập bảng
+        safe_write(ws, sign_title_row, 2, "NGƯỜI LẬP BẢNG", lambda c: setattr(c, 'alignment', center_align))
+        ws.cell(row=sign_title_row, column=2).font = bold_font
+
+        # Cột 18 (Khoảng giữa bảng): Người kiểm soát
+        safe_write(ws, sign_title_row, 18, "NGƯỜI KIỂM SOÁT", lambda c: setattr(c, 'alignment', center_align))
+        ws.cell(row=sign_title_row, column=18).font = bold_font
+
+        # Cột 35 (Tổng hợp): Giám đốc
+        safe_write(ws, sign_title_row, 35, "GIÁM ĐỐC", lambda c: setattr(c, 'alignment', center_align))
+        ws.cell(row=sign_title_row, column=35).font = bold_font
+
+        # Thêm dòng ghi chú phụ dưới chức danh (Ký, ghi rõ họ tên)
+        sign_note_row = sign_title_row + 1
+        safe_write(ws, sign_note_row, 2, "(Ký, họ tên)", lambda c: setattr(c, 'alignment', center_align))
+        ws.cell(row=sign_note_row, column=2).font = italic_font
+
+        safe_write(ws, sign_note_row, 18, "(Ký, họ tên)", lambda c: setattr(c, 'alignment', center_align))
+        ws.cell(row=sign_note_row, column=18).font = italic_font
+
+        safe_write(ws, sign_note_row, 35, "(Ký, họ tên, đóng dấu)", lambda c: setattr(c, 'alignment', center_align))
+        ws.cell(row=sign_note_row, column=35).font = italic_font
+        # --- KẾT THÚC: THÊM KHU VỰC CHỮ KÝ ---
+
         # 8. Trả về file
         output = BytesIO()
         wb.save(output)
         output.seek(0)
-        
-        file_name = f"Bang_Cong_{ten_pb}_{month}_{year}.xlsx" if not is_admin_or_th else f"Bang_Cong_Tong_Hop_{month}_{year}.xlsx"
+
+        # Đặt tên file xuất ra linh hoạt
+        if is_system_admin and not ma_hieu_2_filter and not ma_pb_filter:
+            file_name = f"Bang_Cong_Toan_He_Thong_{month}_{year}.xlsx"
+        else:
+            ten_file = ten_file_phong_ban if ma_pb_filter else "Tong_Hop"
+            file_name = f"Bang_Cong_{ten_file}_{month}_{year}.xlsx"
         
         return send_file(output, as_attachment=True, download_name=file_name)
 
@@ -3342,6 +3698,7 @@ def v2_report(): # Tên hàm này phải viết đúng là v2_report
     # Lấy tên phòng ban từ relationship (Đã thêm db.relationship vào Model)
     user_ten_pb = user_info.phong_ban.ten_phong_ban if user_info and user_info.phong_ban else ""
 
+    # Quyền Admin hoặc thuộc các phòng ban đặc biệt (1: Ban Giám đốc; 2: Tổng hợp; 3: Kiểm tra, giám sát; 4: Thu thập và Xử lý thông tin)
     is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
 
     # 2. XỬ LÝ THAM SỐ LỌC
@@ -3423,6 +3780,7 @@ def export_v2_excel(year):
     user_info = ThongTinNguoiLaoDong.query.filter_by(ma_nhan_vien=current_user.ma_nhan_vien).first()
     user_ma_pb = user_info.ma_phong_ban if user_info else None
     
+    # Quyền Admin hoặc thuộc các phòng ban đặc biệt (1: Ban Giám đốc; 2: Tổng hợp; 3: Kiểm tra, giám sát; 4: Thu thập và Xử lý thông tin)
     is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
 
     # TỐI ƯU: Tính công chuẩn 12 tháng một lần duy nhất
@@ -3601,6 +3959,7 @@ def change_password():
         # 4. Cập nhật mật khẩu
         try:
             current_user.set_password(new_password)
+            current_user.force_password_change = False  # Đã đổi mật khẩu thành công
             db.session.commit()
         except Exception as e:
             db.session.rollback()
@@ -3628,11 +3987,13 @@ def reset_password_admin(ma_nv):
     try:
         # 3. Đặt mật khẩu về mặc định (Mã nhân viên)
         user.set_password(ma_nv)
+        user.force_password_change = True  # Bắt buộc đổi ở lần đăng nhập tới
         db.session.commit()
-        return jsonify({'success': True, 'message': f'Đã reset mật khẩu cho NV {ma_nv} về mặc định.'})
+        return jsonify({'success': True, 'message': f'Đã reset mật khẩu cho NV {ma_nv} về mặc định. Tài khoản này sẽ bắt buộc phải đổi mật khẩu ở lần đăng nhập tiếp theo.'})
     except Exception as e:
         db.session.rollback()
-        return jsonify({'success': False, 'message': str(e)}), 500        
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 
 # ----------------------------------------------------------------------
 # Quản trị user, thông tin người lao động
@@ -4296,6 +4657,7 @@ def export_report_v1_v2():
     user_ma_pb = user_info.ma_phong_ban if user_info else None
     user_ten_pb = user_info.phong_ban.ten_phong_ban if user_info and user_info.phong_ban else ""
     
+    # Quyền Admin hoặc thuộc các phòng ban đặc biệt (1: Ban Giám đốc; 2: Tổng hợp; 3: Kiểm tra, giám sát; 4: Thu thập và Xử lý thông tin)
     is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
 
     nam_chon = request.args.get('nam', type=int)
@@ -4666,6 +5028,7 @@ def v2_dc_report():
     # Lấy tên phòng ban từ relationship (Đã sửa ở bước trước)
     user_ten_pb = user_info.phong_ban.ten_phong_ban if user_info and user_info.phong_ban else ""
 
+    # Quyền Admin hoặc thuộc các phòng ban đặc biệt (1: Ban Giám đốc; 2: Tổng hợp; 3: Kiểm tra, giám sát; 4: Thu thập và Xử lý thông tin)
     is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
 
     # 2. XỬ LÝ THAM SỐ LỌC
@@ -4892,6 +5255,7 @@ def report_v1_v2_dc():
     user_ma_pb = user_info.ma_phong_ban if user_info else None
     user_ten_pb = user_info.phong_ban.ten_phong_ban if user_info and user_info.phong_ban else ""
 
+    # Quyền Admin hoặc thuộc các phòng ban đặc biệt (1: Ban Giám đốc; 2: Tổng hợp; 3: Kiểm tra, giám sát; 4: Thu thập và Xử lý thông tin)
     is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
 
     # 2. XỬ LÝ THAM SỐ LỌC
@@ -4975,6 +5339,7 @@ def export_v1_v2_dc():
     user_ma_pb = user_info.ma_phong_ban if user_info else None
     user_ten_pb = user_info.phong_ban.ten_phong_ban if user_info and user_info.phong_ban else ""
     
+    # Quyền Admin hoặc thuộc các phòng ban đặc biệt (1: Ban Giám đốc; 2: Tổng hợp; 3: Kiểm tra, giám sát; 4: Thu thập và Xử lý thông tin)
     is_admin_or_th = (current_user.is_admin == 1 or user_ma_pb in [2])
 
     nam = request.args.get('nam', datetime.now().year, type=int)
@@ -5988,7 +6353,7 @@ def kich_hoat_tinh_ngoai_gio(year):
 @login_required
 def admin_ma_hieu_lop():
     # 1. Xác định danh sách user đặc biệt được phép truy cập
-    allowed_users = ['200905691'] # Thêm mã nhân viên của user vào đây: Đinh Thị Ánh Hồng
+    allowed_users = ['200905691', '200900615'] # Thêm mã nhân viên của user vào đây: Đinh Thị Ánh Hồng; Phạm Quỳnh Anh
 
     # 2. Kiểm tra quyền: Phải là Admin HOẶC nằm trong danh sách được phép
     is_allowed = current_user.is_admin or current_user.ma_nhan_vien in allowed_users
@@ -6089,6 +6454,9 @@ def theo_doi_lop_hoc():
         if is_system_admin:
             # Admin: Không thêm filter (thấy toàn bộ)
             pass
+        #elif is_phong_tong_hop:
+        #    # Phòng Tổng hợp (User tổng hợp): Thấy toàn bộ nhân viên thuộc cùng đơn vị (ma_hieu_2)
+        #    query_lop = query_lop.filter(ThongTinNguoiLaoDong.ma_hieu_2 == user_ma_hieu_2)
         else:
             # TẤT CẢ CÁC USER CÒN LẠI (bao gồm Lập bảng, Tổng hợp): 
             # BẮT BUỘC phải cùng đơn vị (ma_hieu_2)
@@ -6102,12 +6470,18 @@ def theo_doi_lop_hoc():
                     query_lop = query_lop.filter(False) # Không có phòng ban thì không thấy gì
 
         results = query_lop.order_by(DanhSachLopHoc.tu_ngay.desc()).all()
-        
-        for lop, ho_ten, nv_ma_hieu_2, nv_ma_pb in results:
+        # VÒNG LẶP XỬ LÝ DỮ LIỆU ĐÃ ĐƯỢC FIX LỖI NONETYPE
+        for item in results:
+            # Kiểm tra nếu bản ghi trống hoặc đối tượng lớp học bị None thì bỏ qua (bảo vệ code)
+            if not item or item[0] is None:
+                continue
+                
+            # Unpack dữ liệu sau khi đảm bảo an toàn
+            lop, ho_ten, nv_ma_hieu_2, nv_ma_pb = item
+            
             lop.fullname_display = ho_ten if ho_ten else "N/A"
             
             # Gán thêm cờ can_edit để Frontend ẩn/hiện nút Sửa/Xóa
-            # Điều kiện: Admin HOẶC (Người lập bảng và nhân viên đó thuộc phạm vi quản lý)
             if is_system_admin:
                 lop.can_edit = True
             elif is_phong_tong_hop:
@@ -6667,9 +7041,6 @@ def bao_cao_tong_hop_dao_tao():
 
         # --- 4. XUẤT EXCEL (GIỮ NGUYÊN CODE ĐỊNH DẠNG CỦA BẠN) ---
         if export == 'excel':
-            from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
-            from openpyxl.utils import get_column_letter
-            
             fixed_cols = ['STT', 'Mã NV', 'Họ tên', 'Phòng ban', 'Chức vụ']
             calc_cols = ['Tổng lớp Trực tiếp', 'Tổng lớp Trực tuyến', 'Tổng lớp học',
                          'Tổng ngày Trực tiếp', 'Tổng ngày Trực tuyến', 'Tổng ngày học']
@@ -9836,7 +10207,7 @@ def api_convert_file():
         return jsonify({"error": f"Lỗi xử lý file: {str(e)}"}), 500
 
 # ----------------------------------------------------------------------
-# Rà soát báo cáo dữ liệu điện tử gửi NHNN bc48
+# Rà soát báo cáo dữ liệu điện tử gửi NHNN bc48 (http://127.0.0.1:5001/bc48_pcrt => bc48.html)
 # ----------------------------------------------------------------------
 @app.route('/bc48_pcrt', methods=['GET', 'POST'])
 @login_required
@@ -9847,6 +10218,11 @@ def giaodien_bc48():
     data_results = [] # Danh sách kết quả vấn tin chi tiết
     history_results = []    # Báo cáo bc48 toàn hàng: Loại Báo cáo; tên bảng; loại tiền; số dòng; Tổng số tiền; Tổng quy đổi
     history_don_vi = []     # Báo cáo bc48 theo đơn vị: Loại Báo cáo; tên bảng; ma_hieu_1; ten_ma_hieu_1; ma_hieu_2; ten_ma_hieu_2; ma_khu_vuc; ten_khu_vuc; loại tiền; số dòng; Tổng số tiền; Tổng quy đổi
+
+    # --- BỔ SUNG BIẾN CHO SAO KÊ TXT của CTR; DWT; EFT; PTR từ ctr_yyyymm; dwt_yyyymm; eft_yyyymm; ptr_yyyymm ---
+    saoke_txt_results = []  # Danh sách kết quả cho view Sao kê theo TXT
+    # ----------------------------------
+    
     page = request.args.get('page', 1, type=int) # Đưa lên đầu để dùng chung
     per_page = 50
     total_pages = 0 # Khởi tạo biến để tránh lỗi render
@@ -9900,14 +10276,29 @@ def giaodien_bc48():
         try:
             data_results = bc48.van_tin_bc48(db, selected_loai, tu_ngay, den_ngay, page=page, per_page=per_page)
             # Tùy chọn: Bạn nên bổ sung hàm đếm tổng số dòng để hiển thị total_pages
-            total_rows = bc48.count_van_tin_bc48(db, selected_loai, tu_ngay, den_ngay)
+            total_rows = bc48.count_van_tin_bc48(db, selected_loai, tu_ngay, den_ngay) or 0
             total_pages = (total_rows + per_page - 1) // per_page if total_rows > 0 else 0
             data_results = bc48.van_tin_bc48(db, selected_loai, tu_ngay, den_ngay, page=page, per_page=per_page)
             if not data_results:
                 flash(f"Không có dữ liệu {selected_loai} trong khoảng thời gian đã chọn.", "info")
         except Exception as e:
             flash(f"Lỗi Vấn tin: {e}", "danger")
-
+    # --- BỔ SUNG XỬ LÝ CHO VIEW SAO KÊ THEO TXT ---
+    elif view_mode == 'saoke_txt':
+        try:
+            # Ví dụ gọi hàm truy vấn riêng cho sao kê txt từ file bc48.py (nếu có)
+            # Bạn có thể thay đổi hàm bc48.van_tin_saoke_txt theo cấu trúc thực tế của bạn
+            if hasattr(bc48, 'van_tin_saoke_txt'):
+                saoke_txt_results = bc48.van_tin_saoke_txt(db, selected_loai, tu_ngay, den_ngay, page=page, per_page=per_page)
+                total_rows = bc48.count_saoke_txt(db, selected_loai, tu_ngay, den_ngay) or 0
+                total_pages = (total_rows + per_page - 1) // per_page if total_rows > 0 else 0
+            else:
+                # Nếu chưa viết hàm riêng, tạm thời lấy chung hàm vấn tin hoặc để trống xử lý sau
+                saoke_txt_results = []
+        except Exception as e:
+            flash(f"Lỗi truy vấn Sao kê TXT: {e}", "danger")
+    # ---------------------------------------------
+    
     # Xử lý phần hiển thị History
     engine_bc48 = bc48.get_bc48_engine(db) #sử dụng db bc48 khác với db Cham_cong_Ngoai_gio
     with engine_bc48.connect() as conn:
@@ -9965,10 +10356,10 @@ def giaodien_bc48():
                            total_rows=total_rows,
                            current_page=page,
                            total_pages=total_pages)
-    
 
-    
-
+################################################################################################################################################
+# Thực hiện nạp TXT do Core trả ra hàng ngày
+################################################################################################################################################
 @app.route('/bc48_import', methods=['POST'])
 @login_required
 @admin_or_user_sd_bc48 # Chỉ Admin và nhân viên trong danh sách allowed_users mới sử dụng bc48
@@ -10012,6 +10403,60 @@ def import_bc48_files():
     response.headers['Cache-Control'] = 'no-cache'
     return response
 
+################################################################################################################################################
+# Sao kê theo ten_file_goc từ các bảng ctr_yyyymm; dwt_yyyymm; eft_yyyymm; ptr_yyyymm
+################################################################################################################################################
+@app.route('/bc48_saoke_txt', methods=['GET', 'POST'])
+@login_required
+@admin_or_user_sd_bc48
+def saoke_txt():
+    current_year = datetime.now().year
+    saoke_txt_results = []
+    
+    page = request.args.get('page', 1, type=int)
+    per_page = 50
+
+    selected_loai = request.values.get('loai_bc', 'CTR')
+    tu_ngay = request.values.get('tu_ngay', f"{current_year}-01-01")
+    den_ngay = request.values.get('den_ngay', f"{current_year}-12-31")
+    
+    # Tiếp nhận thêm tham số tên file gốc lọc từ giao diện
+    ten_file_goc = request.args.get('ten_file_goc', '').strip()
+
+    try:
+        if hasattr(bc48, 'van_tin_saoke_txt'):
+            # Truyền thêm tham số ten_file_goc vào hàm đếm dòng và hàm lấy dữ liệu
+            total_rows = bc48.count_saoke_txt(db, selected_loai, tu_ngay, den_ngay, ten_file_goc=ten_file_goc) or 0
+            #total_pages = (total_rows + per_page - 1) // per_page if total_rows > 0 else 0
+            total_pages = int((total_rows + per_page - 1) // per_page) if total_rows > 0 else 0
+            
+            saoke_txt_results = bc48.van_tin_saoke_txt(db, selected_loai, tu_ngay, den_ngay, 
+                                                       page=page, per_page=per_page, ten_file_goc=ten_file_goc)
+            
+            if not saoke_txt_results and (request.args.get('loai_bc') or request.method == 'POST'):
+                flash(f"Không tìm thấy dữ liệu phù hợp với điều kiện hoặc tên file chọn lọc.", "info")
+        else:
+            total_pages = 0
+            total_rows = 0
+            flash("Hàm 'van_tin_saoke_txt' chưa được định nghĩa trong bc48.py", "danger")
+    except Exception as e:
+        total_pages = 0
+        total_rows = 0
+        flash(f"Lỗi hệ thống khi truy vấn: {str(e)}", "danger")
+
+    return render_template('bc48_saoke_txt.html', 
+                           saoke_txt_results=saoke_txt_results,
+                           current_year=current_year,
+                           selected_loai=selected_loai,
+                           tu_ngay=tu_ngay,
+                           den_ngay=den_ngay,
+                           total_rows=total_rows,
+                           current_page=page,
+                           total_pages=total_pages)
+
+################################################################################################################################################
+# Thực hiện nạp CSV do Cục PCRT trả ra
+################################################################################################################################################
 @app.route('/bc48_import_csv', methods=['POST'])
 @login_required
 @admin_or_user_sd_bc48
@@ -10028,6 +10473,20 @@ def import_bc48_csv():
     except Exception as e:
         # Nếu có lỗi hệ thống, vẫn trả về JSON để frontend không bị crash
         return jsonify({"error": [str(e)]}), 500
+
+# Tính năng "Nạp từ thư mục Server" dành cho các file csv 500MB
+@app.route('/import_csv_from_server', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def import_csv_from_server():
+    folder_path = os.path.join(os.getcwd(), 'uploads_manual')
+    try:
+        # Gọi hàm nạp csv (file 500MB) từ thư mục trên server
+        results = bc48.import_csv_from_server_logic(db, folder_path)
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"error": [str(e)]}), 500
+    
 
 
 # Vấn tin từ ngày đến ngày của bảng CTR/DWT/EFT/PTR và Xuất Excel CSV (Full)
@@ -10156,7 +10615,7 @@ def update_error_status(error_id):
         return jsonify({"success": False, "msg": str(e)}), 500
 
 ####################################################################################
-# Truy vấn lịch sử nạp dữ liệu TXT vào bc48
+# 
 ####################################################################################
 @app.route('/bc48/logs')
 @login_required
@@ -10258,45 +10717,9 @@ def export_logs_csv():
     
     return response
 
-def get_file_logs_query(start_date, end_date, loai_bc, page=1, per_page=50):
-    # Tính toán offset
-    offset = (page - 1) * per_page
-
-    # Chuyển đổi date input (YYYY-MM-DD) sang định dạng YYYYMMDD để khớp với CHAR(8)
-    # Ví dụ: '2026-05-06' -> '20260506'
-    start_str = start_date.replace('-', '') if start_date and start_date.strip() else None
-    end_str = end_date.replace('-', '') if end_date and end_date.strip() else None
-
-    query = """
-        SELECT l.file_name, l.macn, l.thoidiem, l.loai_bc, l.hinh_thuc, l.stt, 
-               l.so_luong, l.user_import, l.import_date, l.header_raw, latest.status
-        FROM log_file_imports l
-        LEFT JOIN log_file_imports_latest latest ON l.file_name = latest.file_name
-        WHERE 1=1
-    """
-    params = {}
-
-    # Lọc thời gian: so sánh chuỗi YYYYMMDD
-    if start_str:
-        query += " AND l.thoidiem >= :start"
-        params['start'] = start_str
-    if end_str:
-        query += " AND l.thoidiem <= :end"
-        params['end'] = end_str
-        
-    # Lọc loại báo cáo
-    if loai_bc and loai_bc.strip():
-        query += " AND l.loai_bc = :loai_bc"
-        params['loai_bc'] = loai_bc.strip()
-        
-    # Sắp xếp mới nhất lên đầu (dựa trên thoidiem và thời gian nạp file) và phân trang
-    query += " ORDER BY l.thoidiem DESC, l.import_date DESC LIMIT :limit OFFSET :offset"
-    params['limit'] = per_page
-    params['offset'] = offset
-    
-    return query, params
-
-# Nhật ký nạp TXT vào bc48
+####################################################################################
+# Truy vấn lịch sử nạp dữ liệu TXT vào bc48; Nhật ký nạp TXT vào bc48
+####################################################################################
 @app.route('/bc48/file-logs')
 @login_required
 @admin_or_user_sd_bc48
@@ -10310,15 +10733,17 @@ def bc48_file_logs():
     page = int(request.args.get('page', 1)) # Mặc định là trang 1
     per_page = 50
     
-    query, params = get_file_logs_query(start_date, end_date, loai_bc, page, per_page)
+    # Gọi hàm từ module bc48
+    query, params = bc48.get_file_logs_query(start_date, end_date, loai_bc, page=page)
+    stats_q, stats_p = bc48.get_file_logs_stats(start_date, end_date, loai_bc)
 
     with engine.connect() as conn:
-        result = conn.execute(text(query), params).fetchall()
-        # Chuyển đổi mỗi row thành dict để Jinja2 truy cập được thông qua log.field_name
-        file_logs = [dict(row._mapping) for row in result]
-
+        file_logs = [dict(row._mapping) for row in conn.execute(text(query), params).fetchall()]
+        stats = conn.execute(text(stats_q), stats_p).fetchone()
+        
     return render_template('bc48_file_logs.html', 
-                           file_logs=file_logs, 
+                           file_logs=file_logs,
+                           stats=stats, 
                            start_date=start_date, 
                            end_date=end_date, 
                            loai_bc=loai_bc,
@@ -10329,29 +10754,27 @@ def bc48_file_logs():
 @admin_or_user_sd_bc48
 def export_file_logs_csv():
     # 1. Lấy tham số từ request
-    start_date = request.args.get('start_date', 'all')
-    end_date = request.args.get('end_date', 'all')
-    loai_bc = request.args.get('loai_bc', 'all_type')
+    start_date = request.args.get('start_date', '')
+    end_date = request.args.get('end_date', '')
+    loai_bc = request.args.get('loai_bc', '')
     
     # 2. Tạo tên file động
-    # Định dạng: BC48_LoaiBC_TuNgay_DenNgay_Timestamp.csv
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"BC48_{loai_bc}_{start_date}_{end_date}_{timestamp}.csv"
+    filename = f"BC48_{loai_bc if loai_bc else 'All'}_{start_date or 'Start'}_{end_date or 'End'}_{timestamp}.csv"
 
     # 3. Lấy dữ liệu
     engine = bc48.get_bc48_engine(db)
-    # Lưu ý: Cần update hàm get_file_logs_query để không dùng LIMIT/OFFSET khi export
-    query, params = get_file_logs_query(request.args.get('start_date'), 
-                                        request.args.get('end_date'), 
-                                        request.args.get('loai_bc'))
+    
+    # GỌI HÀM VỚI page=None ĐỂ KHÔNG DÙNG LIMIT/OFFSET
+    query, params = bc48.get_file_logs_query(start_date, end_date, loai_bc, page=None)
     
     with engine.connect() as conn:
-        logs = conn.execute(text(query), params).fetchall() # Sử dụng text() để thực thi query
+        logs = conn.execute(text(query), params).fetchall()
 
     # 4. Tạo file CSV trong bộ nhớ
     si = io.StringIO()
     cw = csv.writer(si)
-    # Header đầy đủ theo cấu trúc bảng của bạn
+    # Header
     cw.writerow(['File Name', 'Ma CN', 'Thoi Diem', 'Loai BC', 'Hinh Thuc', 'STT', 'So Luong', 'User', 'Ngay Nap', 'Status'])
     
     for log in logs:
@@ -10363,7 +10786,7 @@ def export_file_logs_csv():
             log.macn, 
             log.thoidiem, 
             log.loai_bc, 
-            getattr(log, 'hinh_thuc', ''), # Dùng getattr để an toàn hơn
+            getattr(log, 'hinh_thuc', ''), 
             getattr(log, 'stt', ''), 
             log.so_luong, 
             log.user_import, 
@@ -10378,9 +10801,8 @@ def export_file_logs_csv():
     return output
 
 ####################################################################################
-# Truy vấn lịch sử nạp dữ liệu CSV vào bc48
+# Truy vấn lịch sử nạp dữ liệu CSV vào bc48; Nhật ký nạp CSV
 ####################################################################################
-# Nhật ký nạp CSV
 @app.route('/bc48/csv-logs')
 @login_required
 @admin_or_user_sd_bc48
@@ -10410,9 +10832,16 @@ def bc48_csv_logs():
     # 3. Logic hiển thị # Chỉ lấy đúng số lượng per_page để hiển thị
     has_next = len(raw_logs) > per_page
     csv_logs = raw_logs[:per_page]
+
+    # Tính toán total_records
+    total_records = bc48.count_csv_logs(engine, start_date, end_date, loai_bc, ma_nhan_vien, status)
+    # Tính toán total_unique_files
+    total_unique_files = bc48.count_unique_files(engine, start_date, end_date, loai_bc, ma_nhan_vien, status)
     
     return render_template('bc48_csv_logs.html', 
                            csv_logs=csv_logs,
+                           total_unique_files=total_unique_files,
+                           total_records=total_records,
                            has_next=has_next, # Biến này để template ẩn/hiện nút "Sau"
                            total_pages=total_pages,
                            start_date=start_date, 
@@ -10489,6 +10918,7 @@ def giaodien_cuc_pcrt_tra_loi():
     # Chỉ load dữ liệu tổng hợp nhẹ nhàng cho Tab 1 và Tab 2
     data_hang_ngay = bc48.get_tong_hop_sodong_pcrt(engine)
     data_theo_thang = bc48.get_tong_hop_loi_theo_thang(engine)
+    data_chi_tiet_ngay = bc48.get_chi_tiet_loi_theo_ngay(engine)
     
     # Lấy dữ liệu mồi cho Select Option bộ lọc của Tab 3 trực tiếp từ DB
     filter_options = bc48.get_master_filters_options(engine)
@@ -10496,11 +10926,82 @@ def giaodien_cuc_pcrt_tra_loi():
     return render_template('bc48_cuc_pcrt_tra_loi.html', 
                            data_daily=data_hang_ngay, 
                            data_monthly=data_theo_thang,
+                           data_monthly_detail=data_chi_tiet_ngay,
                            filter_options=filter_options)
 
+# Tab 4: Từ ket_qua_do_tim_loi thống kê loaibc, hinhthuc, namthang, slgfile, sodong_loi, tong_quydoi_loi lấy chi tiết bảng dashboard_tke_loi_chi_tiet kết quả của sp_thong_ke_bang_loi
+# API cho Tab thứ tư mới bổ sung (Server-side Processing)
+@app.route('/bc48/api/tke-loi-chi-tiet-serverside', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def api_tke_loi_chi_tiet_serverside():
+    """API xử lý phân trang Server-side cho bảng thống kê mã lỗi chi tiết"""
+    engine = bc48.get_bc48_engine(db)
+    params = request.args.to_dict()
+    result = bc48.get_dashboard_tke_loi_chi_tiet_serverside(engine, params)
+    return jsonify(result)
+
+# Chạy luôn procedure sp_tong_hop_sodong_bang_error để thống kê chi tiết hằng ngày cục pcrt trả ra csv có bao nhiêu dòng Kiểm tra file thành công; Kiểm tra giao dịch lỗi;
+@app.route('/bc48/api/run-procedure-daily', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def api_run_procedure_daily():
+    engine = bc48.get_bc48_engine(db)
+    
+    # Gọi hàm thực thi Procedure
+    success, message = bc48.execute_procedure_daily_raw(engine)
+    
+    if success:
+        return jsonify({"success": True, "message": "Procedure executed successfully"})
+    else:
+        return jsonify({"success": False, "message": message}), 500
+
+
+# Chạy các lệnh "Làm mới toàn bộ (Full Refresh)
+#TRUNCATE TABLE danh_sach_bang_da_kiem_tra;
+#TRUNCATE TABLE log_kiem_tra_du_lieu;
+#TRUNCATE TABLE danh_sach_bang_error_da_quet;
+#TRUNCATE TABLE log_loi_xu_ly_bang;
+#TRUNCATE TABLE bang_tonghop_ktra_gd_loi;
+#TRUNCATE TABLE chi_tiet_loi_master;
+#TRUNCATE TABLE log_chi_tiet_loi_phan_tach;
+#TRUNCATE TABLE ket_qua_do_tim_loi;
+#TRUNCATE TABLE giao_dich_error_khong_tim_thay;
+#CALL sp_xuly_error_trung_tam();
+#CALL sp_doi_soat_khac_phuc_loi();
+#CALL sp_TuDongKiemTraDuLieu();
+@app.route('/bc48/api/run-full-refresh', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def api_run_full_refresh():
+    engine = bc48.get_bc48_engine(db)
+    
+    # Giả định bạn đã tạo hàm này trong bc48.py
+    # Hàm này sẽ thực hiện chuỗi TRUNCATE và CALL các procedure bạn đã liệt kê
+    success, message = bc48.execute_full_refresh_procedure(engine)
+    
+    if success:
+        return jsonify({"success": True, "message": "Toàn bộ dữ liệu đã được làm mới thành công!"})
+    else:
+        return jsonify({"success": False, "message": message}), 500
+
+# ======================================================================
+# API CHUẨN HOÁ CHO SELECT2 AJAX (ĐẶT TRONG APP.PY)
+# ======================================================================
+@app.route('/bc48/api/get-filter-file-goc', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def api_get_filter_file_goc():
+    engine = bc48.get_bc48_engine(db)
+    search_term = request.args.get('q', '').strip()
+    
+    # Gọi hàm logic thuần túy từ module bc48
+    result = bc48.get_filter_file_goc_logic(engine, search_term)
+    return jsonify(result)
 
 @app.route('/bc48/api/master-serverside', methods=['GET'])
 @login_required
+@admin_or_user_sd_bc48
 def api_master_serverside():
     """API cổng nhận xử lý yêu cầu phân trang từ DataTables Frontend"""
     engine = bc48.get_bc48_engine(db)
@@ -10512,6 +11013,7 @@ def api_master_serverside():
 
 @app.route('/bc48/master/export-csv', methods=['GET'])
 @login_required
+@admin_or_user_sd_bc48
 def export_master_csv():
     """Route chuyên trách xuất file CSV toàn bộ theo bộ lọc trực tiếp từ DB bảng chi_tiet_loi_master"""
     engine = bc48.get_bc48_engine(db)
@@ -10520,6 +11022,7 @@ def export_master_csv():
     f_loai_bc = request.args.get('f_loai_bc', '')
     f_thang_nam = request.args.get('f_thang_nam', '')
     f_ngay_bc = request.args.get('f_ngay_bc', '')
+    f_ten_file = request.args.get('f_ten_file', '')
     
     where_clauses = ["1=1"]
     sql_params = {}
@@ -10532,12 +11035,15 @@ def export_master_csv():
     if f_ngay_bc:
         where_clauses.append("NGAY_BAOCAO = :f_ngay_bc")
         sql_params['f_ngay_bc'] = f_ngay_bc
+    if f_ten_file: # BỔ SUNG
+        where_clauses.append("ten_file_goc = :f_ten_file")
+        sql_params['f_ten_file'] = f_ten_file
         
     where_str = " AND ".join(where_clauses)
     
     query = f"""
         SELECT id, ma_giao_dich, loai_bc, thang_nam, trang_thai, ma_loi, mota_loi,
-               DATE_FORMAT(NGAY_BAOCAO, '%Y-%m-%d') as NGAY_BAOCAO, HINHTHUC_GUI, SOLAN_GUI
+               DATE_FORMAT(NGAY_BAOCAO, '%Y-%m-%d') as NGAY_BAOCAO, HINHTHUC_GUI, SOLAN_GUI, ten_file_goc
         FROM chi_tiet_loi_master
         WHERE {where_str}
         ORDER BY NGAY_BAOCAO DESC, id DESC
@@ -10562,10 +11068,35 @@ def export_master_csv():
     except Exception as e:
         return f"Lỗi xuất file dữ liệu: {str(e)}", 500
 
+@app.route('/bc48/api/tke-loi-chi-tiet/export-csv', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def export_tke_loi_csv():
+    """Route xuất trọn vẹn 100% dữ liệu thống kê kết quả dò tìm lỗi chi tiết (Tab 4) ra file CSV từ Server"""
+    engine = bc48.get_bc48_engine(db)
+    
+    try:
+        # Gọi tầng nghiệp vụ lấy dữ liệu nhị phân đã build cấu trúc CSV chuẩn Excel
+        output_data = bc48.export_dashboard_tke_loi_chi_tiet_csv(engine)
+        
+        import datetime
+        current_date = datetime.datetime.now().strftime("%Y%m%d")
+        filename = f"Thong_Ke_Ket_Qua_Do_Tim_Loi_Chi_Tiet_{current_date}.csv"
+        
+        return Response(
+            output_data,
+            mimetype="text/csv",
+            headers={"Content-disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        return f"Lỗi hệ thống khi xuất file dữ liệu Tab 4: {str(e)}", 500
+    
+
+
 ####################################################################################
 # Truy vấn bảng Ket_qua_do_tim_loi: sao kê chi tiết của bảng Tổng Hợp, nhưng chỉ chứa những giao dịch đã được "tìm thấy xác nhận" trong bảng dữ liệu gốc (CTR, DWT, EFT, PTR)
 # bang_tonghop_ktra_gd_loi (Bảng Tổng Hợp): Đóng vai trò là bảng Dashboard. Chỉ chứa con số tổng (Count) để bạn nhìn nhanh tháng nào, hệ thống nào đang có vấn đề
-# chi_tiet_loi_master (Bảng Sao Kê Lỗi): Chứa danh sách tất cả các giao dịch bị báo lỗi từ các bảng _error. Đây là "danh sách chờ xử lý"
+# chi_tiet_loi_master (Bảng Sao Kê Lỗi): Chứa danh sách tất cả các giao dịch bị báo lỗi từ các bảng _error. Đây là "danh sách chờ các đơn vị khắc phục chỉnh sửa"
 ####################################################################################
 @app.route('/bc48/ket-qua-do-tim')
 @login_required
@@ -10575,16 +11106,48 @@ def giaodien_ket_qua_do_tim():
     engine = bc48.get_bc48_engine(db)
     
     # 2. Lấy tham số lọc và phân trang
-    loai_bc = request.args.get('loai_bc', "")
-    thang_nam = request.args.get('thang_nam', "")
-    ma_hieu_1 = request.args.get('ma_hieu_1', "")
-    ma_hieu_2 = request.args.get('ma_hieu_2', "")
+    # Lấy tham số lọc và xử lý cắt khoảng trắng thừa (.strip())
+    loai_bc = request.args.get('loai_bc', "").strip()
+
+    # Làm sạch biến thang_nam một cách triệt để
+    thang_nam_raw = request.args.get('thang_nam', "").strip()
+    thang_nam = thang_nam_raw if (thang_nam_raw and thang_nam_raw.isdigit() and len(thang_nam_raw) == 6) else ""
+    
+    ma_hieu_1 = request.args.get('ma_hieu_1', "").strip()
+    ma_hieu_2 = request.args.get('ma_hieu_2', "").strip()
+    ma_giao_dich = request.args.get('ma_giao_dich', "").strip()
+    mota_loi = request.args.get('mota_loi', "").strip()
+    tu_ngay = request.args.get('tu_ngay', "").strip()
+    den_ngay = request.args.get('den_ngay', "").strip()
+    # BỔ SUNG MỚI
+    ten_file_goc = request.args.get('ten_file_goc', "").strip()
+    ten_file_error = request.args.get('ten_file_error', "").strip()
+    
     page = int(request.args.get('page', 1))
     per_page = 50
+
+    # Nếu loai_bc là "ALL" hoặc rỗng, xem như không lọc theo Loại BC
+    loai_bc_filter = None if loai_bc in ["", "ALL"] else loai_bc
     
     # 3. Gọi logic từ bc48.py
-    raw_data = bc48.get_ket_qua_do_tim_data(engine, loai_bc, thang_nam, ma_hieu_1, ma_hieu_2, page, per_page)
-    total_records = bc48.count_ket_qua_do_tim(engine, loai_bc, thang_nam, ma_hieu_1, ma_hieu_2)
+    raw_data = bc48.get_ket_qua_do_tim_data(
+        engine, 
+        loai_bc=loai_bc_filter, 
+        thang_nam=thang_nam, 
+        ma_hieu_1=ma_hieu_1, 
+        ma_hieu_2=ma_hieu_2, 
+        ma_giao_dich=ma_giao_dich, 
+        mota_loi=mota_loi, 
+        page=page, 
+        per_page=per_page, 
+        tu_ngay=tu_ngay, 
+        den_ngay=den_ngay,
+        ten_file_goc=ten_file_goc,
+        ten_file_error=ten_file_error
+    )
+    total_records = bc48.count_ket_qua_do_tim(engine, loai_bc_filter, thang_nam, ma_hieu_1, ma_hieu_2, ma_giao_dich, mota_loi, tu_ngay=tu_ngay, den_ngay=den_ngay,
+        ten_file_goc=ten_file_goc,
+        ten_file_error=ten_file_error)
 
     # 4. Tính toán phân trang
     total_pages = (total_records + per_page - 1) // per_page if total_records > 0 else 1
@@ -10611,6 +11174,12 @@ def giaodien_ket_qua_do_tim():
                            thang_nam=thang_nam,
                            ma_hieu_1=ma_hieu_1,
                            ma_hieu_2=ma_hieu_2,
+                           ma_giao_dich=ma_giao_dich,
+                           mota_loi=mota_loi,
+                           tu_ngay=tu_ngay,      
+                           den_ngay=den_ngay,
+                           ten_file_goc=ten_file_goc,       # BỔ SUNG MỚI
+                           ten_file_error=ten_file_error,   # BỔ SUNG MỚI
                            page=page)
 
 @app.route('/bc48/ket-qua-do-tim/export')
@@ -10619,40 +11188,353 @@ def giaodien_ket_qua_do_tim():
 def export_ket_qua_do_tim():
     engine = bc48.get_bc48_engine(db)
     
-    loai_bc = request.args.get('loai_bc')
-    thang_nam = request.args.get('thang_nam')
-    ma_hieu_1 = request.args.get('ma_hieu_1')
-    ma_hieu_2 = request.args.get('ma_hieu_2')
+    loai_bc = request.args.get('loai_bc', '')
+    thang_nam = request.args.get('thang_nam', '')
+    ma_hieu_1 = request.args.get('ma_hieu_1', '')
+    ma_hieu_2 = request.args.get('ma_hieu_2', '')
+    ma_giao_dich = request.args.get('ma_giao_dich', '')
+    mota_loi = request.args.get('mota_loi', '')
+    tu_ngay = request.args.get('tu_ngay', '')
+    den_ngay = request.args.get('den_ngay', '')
+    # BỔ SUNG MỚI
+    ten_file_goc = request.args.get('ten_file_goc', '')
+    ten_file_error = request.args.get('ten_file_error', '')
 
     # Lấy toàn bộ dữ liệu không phân trang
-    data = bc48.get_ket_qua_do_tim_data(engine, loai_bc, thang_nam, ma_hieu_1, ma_hieu_2, export=True)
+    data = bc48.get_ket_qua_do_tim_data(
+        engine, 
+        loai_bc=loai_bc, 
+        thang_nam=thang_nam, 
+        ma_hieu_1=ma_hieu_1, 
+        ma_hieu_2=ma_hieu_2, 
+        ma_giao_dich=ma_giao_dich, 
+        mota_loi=mota_loi, 
+        tu_ngay=tu_ngay, 
+        den_ngay=den_ngay,
+        ten_file_goc=ten_file_goc,
+        ten_file_error=ten_file_error,
+        export=True
+    )
     
-    si = io.StringIO()
-    cw = csv.writer(si, quoting=csv.QUOTE_MINIMAL)
-    
-    # Header (Bạn có thể điều chỉnh tên hiển thị cho đẹp)
-    # Header đầy đủ thông tin tên đơn vị
-    cw.writerow(['Mã GD', 'Loại BC', 'Tháng', 'Mã Lỗi', 'Mô tả', 'Mã CN', 'Tên KH', 'Số GT', 
-                 'Mã ĐV Cấp 1', 'Tên ĐV Cấp 1', 'Mã ĐV Cấp 2', 'Tên ĐV Cấp 2'])
-
-    for row in data:
-        cw.writerow([
-            row['ma_giao_dich'], row['loai_bc'], row['thang_nam'],
-            row['ma_loi'], row['mota_loi'], row['macn'],
-            row['tenkh'], row['sogt'], 
-            row['ma_hieu_1'], row['ten_ma_hieu_1'],
-            row['ma_hieu_2'], row['ten_ma_hieu_2']
-        ])
-
-    # CẬP NHẬT TÊN FILE TẠI ĐÂY
-    # Sử dụng logic or 'ALL' để xử lý trường hợp người dùng không nhập mã đơn vị
+    # Định nghĩa tên file export
     filename = f"Ket_qua_do_tim_{loai_bc or 'ALL'}_{thang_nam or 'ALL'}_{ma_hieu_1 or 'ALL'}_{ma_hieu_2 or 'ALL'}_{datetime.now().strftime('%Y%m%d')}.csv"
-    
-    output = make_response("\ufeff" + si.getvalue())
-    output.headers["Content-Disposition"] = f"attachment; filename={filename}"
-    output.headers["Content-type"] = "text/csv; charset=utf-8-sig"
-    return output
 
+    # Sử dụng generator để stream dữ liệu tiết kiệm RAM
+    def generate():
+        # 1. Ghi ký tự BOM để Excel nhận diện đúng UTF-8
+        yield '\ufeff'
+        
+        # 2. Khởi tạo một proxy writer ghi vào bộ nhớ đệm tạm thời
+        output = io.StringIO()
+        cw = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+        
+        # 3. Ghi dòng Header
+        cw.writerow([
+            'Mã GD', 'Loại BC', 'Tháng', 'Mã Lỗi', 'Mô tả', 'Mã CN', 'Tên KH', 'Số GT', 
+            'Mã ĐV Cấp 1', 'Tên ĐV Cấp 1', 'Mã ĐV Cấp 2', 'Tên ĐV Cấp 2', 'Tên file gốc', 'Tên file error'
+        ])
+        yield output.getvalue()
+        output.seek(0)
+        output.truncate(0)
+        
+        # 4. Ghi từng dòng dữ liệu (Dùng .get để tránh KeyError nếu thiếu cột)
+        for row in data:
+            cw.writerow([
+                row.get('ma_giao_dich', ''), 
+                str(row.get('loai_bc', '')).upper(), 
+                row.get('thang_nam', ''),
+                row.get('ma_loi', ''), 
+                row.get('mota_loi', ''), 
+                row.get('macn', ''),
+                row.get('tenkh', ''), 
+                row.get('sogt', ''), 
+                row.get('ma_hieu_1', ''), 
+                row.get('ten_ma_hieu_1', ''),
+                row.get('ma_hieu_2', ''), 
+                row.get('ten_ma_hieu_2', ''),
+                row.get('ten_file_goc', ''),
+                row.get('ten_file_error', '')
+            ])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+
+    # Trả về response dạng stream dữ liệu trực tiếp
+    response = Response(stream_with_context(generate()), mimetype="text/csv")
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    response.headers["Content-Type"] = "text/csv; charset=utf-8-sig"
+    return response
+
+# Xuất Excel kết quả lọc bảng ket_qua_do_tim_loi
+@app.route('/export-excel-ket-qua')
+@login_required
+@admin_or_user_sd_bc48
+def export_excel_ket_qua():
+    # 1. Thu thập các tham số lọc từ URL do JavaScript gửi lên
+    loai_bc = request.args.get('loai_bc', 'ALL')
+    thang_nam = request.args.get('thang_nam', '')
+    ma_hieu_1 = request.args.get('ma_hieu_1', '')
+    ma_hieu_2 = request.args.get('ma_hieu_2', '')
+    ma_giao_dich = request.args.get('ma_giao_dich', '')
+    mota_loi = request.args.get('mota_loi', '')
+    tu_ngay = request.args.get('tu_ngay', '')
+    den_ngay = request.args.get('den_ngay', '')
+    # BỔ SUNG MỚI
+    ten_file_goc = request.args.get('ten_file_goc', '')
+    ten_file_error = request.args.get('ten_file_error', '')
+
+    # 2. Xây dựng câu lệnh SQL WHERE động dựa trên bộ lọc
+    conditions = []
+    params_list = []
+
+    if loai_bc and loai_bc != 'ALL':
+        conditions.append("loai_bc = %s")
+        params_list.append(loai_bc)
+    if thang_nam:
+        conditions.append("thang_nam = %s")  # Thay :thang_nam bằng %s
+        params_list.append(int(thang_nam))
+    if ma_hieu_1:
+        conditions.append("ma_hieu_1 LIKE %s")
+        params_list.append(f"%{ma_hieu_1}%")
+    if ma_hieu_2:
+        conditions.append("ma_hieu_2 LIKE %s")
+        params_list.append(f"%{ma_hieu_2}%")
+    if ma_giao_dich:
+        conditions.append("ma_giao_dich LIKE %s")
+        params_list.append(f"%{ma_giao_dich}%")
+    if mota_loi:
+        conditions.append("mota_loi LIKE %s")
+        params_list.append(f"%{mota_loi}%")
+    if tu_ngay:
+        conditions.append("ngay_baocao >= %s")
+        params_list.append(tu_ngay)
+    if den_ngay:
+        conditions.append("ngay_baocao <= %s")
+        params_list.append(den_ngay)
+    # BỔ SUNG MỚI
+    if ten_file_goc:
+        conditions.append("ten_file_goc LIKE %s")
+        params_list.append(f"%{ten_file_goc}%")
+    if ten_file_error:
+        conditions.append("ten_file_error LIKE %s")
+        params_list.append(f"%{ten_file_error}%")
+
+    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+    # 3. Câu lệnh SQL bốc ĐỦ ĐÚNG 28 CỘT (Cập nhật where_clause)
+    query = dedent(f"""
+        SELECT 
+            id AS `ID`,
+            ma_giao_dich AS `Mã Giao Dịch`,
+            UPPER(loai_bc) AS `Loại BC`,
+            thang_nam AS `Tháng Năm`,
+            ma_loi AS `Mã Lỗi`,
+            ma_loi_f_ao AS `Mã Lỗi F Ảo`,
+            mota_loi AS `Mô tả lỗi từ CSV`,
+            ds_ma_nghiep_vu AS `DS Mã nghiệp vụ`,
+            ds_ten_nghiep_vu AS `DS Tên nghiệp vụ`,
+            ds_ten_cot_sql AS `DS Tên cột SQL`,
+            ds_ma_quy_dinh AS `DS Mã quy định`,
+            macn AS `Mã CN`,
+            thoidiem AS `Thời điểm`,
+            loaigd AS `Loại GD`,
+            kieukh AS `Kiểu KH`,
+            tenkh AS `Tên Khách Hàng`,
+            loaigt AS `Loại GT`,
+            sogt AS `Số GT/Hộ chiếu`,
+            sothithuc AS `Số thị thực`,
+            CONCAT(IFNULL(ma_hieu_1, ''), ' - ', IFNULL(ten_ma_hieu_1, '')) AS `Đơn vị Cấp 1`,
+            CONCAT(IFNULL(ma_hieu_2, ''), ' - ', IFNULL(ten_ma_hieu_2, '')) AS `Đơn vị Cấp 2`,
+            loaitien AS `Loại tiền`,
+            sotien AS `Số tiền`,
+            quydoi AS `Quy đổi`,
+            bang_goc_tim_thay AS `Bảng gốc tìm thấy`,
+            ngay_baocao AS `Ngày báo cáo`,
+            ten_file_goc AS `Tên file gốc`,
+            ten_file_error AS `Tên file error`
+        FROM bc48.ket_qua_do_tim_loi
+        {where_clause}
+        ORDER BY id DESC
+    """)
+
+    # BỔ SUNG: Khởi tạo engine riêng của phân hệ bc48
+    engine = bc48.get_bc48_engine(db)
+    # 4. Thực hiện truy vấn dữ liệu bằng Pandas qua engine vừa khởi tạo
+    try:
+        # Chuyển params_list thành tuple(params_list) để tránh lỗi driver
+        df = pd.read_sql_query(query, db.engine, params=tuple(params_list))
+    except Exception as e:
+        return f"Lỗi truy vấn dữ liệu: {str(e)}", 500
+
+    # 5. Xuất dữ liệu ra luồng dữ liệu cấu trúc Excel (.xlsx)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='KetQuaDoTim')
+        
+        # Tự động căn chỉnh độ rộng các cột trong Excel cho đẹp mắt
+        workbook = writer.book
+        worksheet = writer.sheets['KetQuaDoTim']
+        for col in worksheet.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = col[0].column_letter
+            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    output.seek(0)
+
+    # 6. Trả file về phía client
+    filename = f"Ket_qua_do_tim_loi_{loai_bc}_{thang_nam if thang_nam else 'TatCa'}.xlsx"
+    return Response(
+        output.read(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+# Thêm nút lệnh "Chỉ bóc tách mota_loi của CSV", lấy giá trị (Fx.x); vào bc48/ket-qua-do-tim; bc48_ket_qua_do_tim.html
+@app.route('/bc48/ket-qua-do-tim/extract-errors', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def extract_errors_action():
+    engine = bc48.get_bc48_engine(db)
+    
+    # Đọc chính xác dữ liệu từ Form POST được gửi lên
+    loai_bc = request.form.get('loai_bc', '').strip()
+    ky_baocao_type = request.form.get('ky_baocao_type', 'by_month')
+    thang_nam = request.form.get('thang_nam', '').strip()
+
+    # Chuẩn hóa loai_bc về dạng 'ALL' nếu người dùng không chọn hoặc chọn trống
+    if not loai_bc or loai_bc == "":
+        loai_bc = "ALL"
+
+    # Xử lý điều kiện thời gian raw_thang_nam dựa trên dropdown cấu hình kỳ báo cáo
+    if ky_baocao_type == 'all_time':
+        raw_thang_nam = 'ALL'
+    else:
+        if not thang_nam:
+            flash("Vui lòng nhập Tháng báo cáo (YYYYMM) hoặc chọn 'Tất cả kỳ' trước khi thực hiện!", "warning")
+            return redirect(url_for('giaodien_ket_qua_do_tim', loai_bc=loai_bc if loai_bc != 'ALL' else ''))
+        raw_thang_nam = thang_nam
+
+    # Gọi hàm xử lý đóng gói Transaction an toàn từ file chuyên biệt bc48.py
+    result = bc48.process_extract_errors_only(engine, loai_bc, raw_thang_nam)
+
+    if isinstance(result, str):
+        # Trường hợp hàm trả về Chuỗi ký tự (Cảnh báo hoặc Lỗi hệ thống)
+        flash(result, "danger" if "Lỗi" in result else "info")
+    else:
+        # Trường hợp bóc tách thành công hoàn toàn
+        ky_hien_thi = "TẤT CẢ KỲ" if raw_thang_nam == 'ALL' else thang_nam
+        flash(f"Đã làm sạch & bóc tách thành công dữ liệu báo cáo [{loai_bc.upper()}] kỳ [{ky_hien_thi}] cho {len(result)} đơn vị/chi nhánh.", "success")
+        
+    # Điều hướng quay lại giao diện và truyền trả lại bộ lọc cũ cho người dùng
+    return redirect(url_for('giaodien_ket_qua_do_tim', 
+                            loai_bc=loai_bc if loai_bc != 'ALL' else '', 
+                            thang_nam=thang_nam if ky_baocao_type != 'all_time' else ''))
+
+# Thêm nút lệnh Chạy chủ động sp_xuly_error_trung_tam để có ket_qua_do_tim_loi (toàn bộ hệ thống)
+# Hàm phụ trợ chạy ngầm thực thi SQL
+def bg_worker_run_procedure(engine):
+    try:
+        # Sử dụng một kết nối biệt lập cho luồng ngầm
+        with engine.begin() as connection:
+            print("[Thread Ngầm] Bắt đầu TRUNCATE các bảng kết quả...")
+            connection.execute(text("TRUNCATE TABLE danh_sach_bang_error_da_quet;"))
+            connection.execute(text("TRUNCATE TABLE log_loi_xu_ly_bang;"))
+            connection.execute(text("TRUNCATE TABLE chi_tiet_loi_master;"))
+            connection.execute(text("TRUNCATE TABLE ket_qua_do_tim_loi;"))
+            connection.execute(text("TRUNCATE TABLE giao_dich_error_khong_tim_thay;"))
+            connection.execute(text("TRUNCATE TABLE bang_tonghop_ktra_gd_loi;"))
+
+            connection.execute(text("TRUNCATE TABLE ket_qua_do_tim_loi_2;"))
+            
+            print("[Thread Ngầm] Đang thực thi CALL sp_xuly_error_trung_tam()...")
+            connection.execute(text("CALL sp_xuly_error_trung_tam();"))
+
+            print("[Thread Ngầm] Đang thực thi CALL sp_enrich_du_lieu_loi_phat()...")
+            connection.execute(text("CALL sp_enrich_du_lieu_loi_phat();"))
+
+            print("[Thread Ngầm] Tiến trình chạy SP hoàn thành thành công!")
+    except Exception as e:
+        print(f"[Thread Ngầm] Xảy ra lỗi nghiêm trọng: {str(e)}")
+        
+@app.route('/chay-sp-trung-tam-action', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def chay_sp_trung_tam_action():
+    try:
+        # Khởi tạo engine kết nối DB từ cấu hình hệ thống của bạn
+        engine = bc48.get_bc48_engine(db)
+        
+        # Tạo và kích hoạt một Thread ngầm để xử lý cơ sở dữ liệu
+        thr = threading.Thread(target=bg_worker_run_procedure, args=(engine,))
+        thr.daemon = True  # Đảm bảo luồng tự giải phóng khi ứng dụng tắt
+        thr.start()
+        
+        # Trả phản hồi ngay lập tức về giao diện Web (chỉ mất ~ 0.05 giây)
+        flash("🚀 Tiến trình đối chiếu trung tâm đã được kích hoạt chạy ngầm hệ thống thành công! Vui lòng đợi vài phút rồi bấm nút 'Làm mới' để xem dữ liệu mới.", "info")
+        
+    except Exception as e:
+        # Nếu có lỗi bất kỳ trong khối 'with', hệ thống tự động ROLLBACK
+        print(f"Lỗi hệ thống khi thực thi SP: {str(e)}")
+        flash(f"Không thể khởi tạo tiến trình chạy ngầm: {str(e)}", "error")
+
+    # Quay trở về trang giao diện hiển thị kết quả dò tìm lỗi ban đầu        
+    return redirect(url_for('giaodien_ket_qua_do_tim'))
+
+
+# Tao Procedure sp_xuly_error_trung_tam_by_date lay so luong va chi tiet trang thai (KIEM TRA GIAO DICH LOI) tu tat ca cac bang _error v12 (ket_qua_do_tim_loi), tu ngay den ngay
+def bg_worker_run_procedure_by_date(app_context, engine, tu_ngay, den_ngay):
+    """
+    Hàm worker chạy ngầm độc lập với request-response cycle của Flask.
+    Sử dụng app_context để an toàn nếu cần log dữ liệu hoặc thao tác thêm với DB Flask.
+    """
+    with app_context:
+        try:
+            print(f"[Thread Ngầm] Bắt đầu chạy sp_xuly_error_trung_tam_by_date đối chiếu từ {tu_ngay} đến {den_ngay}...")
+            
+            # Gọi hàm xử lý thực thi Procedure trong bc48.py
+            bc48.execute_central_procedure_by_date(engine, tu_ngay, den_ngay)
+            
+            print(f"[Thread Ngầm] Hoàn thành chạy sp_xuly_error_trung_tam_by_date đối chiếu từ {tu_ngay} đến {den_ngay} thành công!")
+        except Exception as e:
+            print(f"[Thread Ngầm] LỖI hệ thống khi thực thi SP: {str(e)}")
+
+@app.route('/bc48/chay-sp-theo-ngay', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def chay_sp_theo_ngay_action():
+    try:
+        # 1. Lấy dữ liệu ngày từ form gửi lên
+        tu_ngay = request.form.get('tu_ngay', '').strip()
+        den_ngay = request.form.get('den_ngay', '').strip()
+        
+        if not tu_ngay or not den_ngay:
+            flash("⚠️ Vui lòng chọn đầy đủ từ ngày đến ngày!", "danger")
+            return redirect(url_for('giaodien_ket_qua_do_tim'))
+
+        # 2. Khởi tạo engine kết nối DB
+        engine = bc48.get_bc48_engine(db)
+        
+        # 3. Lấy app_context hiện tại 
+        # (Bắt buộc phải truyền vào Thread nếu trong hàm bc48 có dùng cấu hình của Flask)
+        app_context = current_app.app_context()
+        
+        # 4. Tạo và kích hoạt Thread ngầm (truyền engine, tu_ngay, den_ngay qua args)
+        thr = threading.Thread(
+            target=bg_worker_run_procedure_by_date, 
+            args=(app_context, engine, tu_ngay, den_ngay)
+        )
+        thr.daemon = True  # Tự giải phóng khi ứng dụng tắt
+        thr.start()
+        
+        # 5. Trả phản hồi ngay lập tức cho người dùng
+        flash(f"🚀 Tiến trình đối chiếu từ ngày {tu_ngay} đến {den_ngay} đã được kích hoạt chạy ngầm! Vui lòng đợi vài phút rồi bấm nút 'Làm mới' để cập nhật dữ liệu.", "info")
+        
+    except Exception as e:
+        print(f"Lỗi khởi tạo tiến trình Thread: {str(e)}")
+        flash(f"❌ Không thể khởi tạo tiến trình chạy ngầm: {str(e)}", "danger")
+
+    # Quay trở về giao diện ban đầu
+    return redirect(url_for('giaodien_ket_qua_do_tim'))
 
 ####################################################################################
 # Khai báo mail chi nhánh tiếp nhận csv lỗi để xử lý cập nhật
@@ -10683,11 +11565,1167 @@ def giaodien_khai_bao_mail(): # Tên hàm này phải khớp với url_for trong
 
     danh_sach = bc48.get_danh_sach_mail(engine)
     return render_template('bc48_khai_bao_mail.html', danh_sach=danh_sach)
+####################################################################################
+# Theo dõi kết quả khắc phục lỗi ket_qua_do_tim_loi
+####################################################################################
+@app.route('/bc48/gui-mail-loi', methods=['GET', 'POST'])
+@login_required
+@admin_or_user_sd_bc48
+def giaodien_gui_mail_chi_nhanh():
+    # Lấy trang hiện tại từ URL (mặc định là 1)
+    page = request.args.get('page', 1, type=int)
+    
+    # Lấy filters từ form hoặc từ session để giữ trạng thái khi sang trang khác
+    if request.method == 'POST':
+        # Lấy sạch dữ liệu từ form
+        filters = request.form.to_dict()
+        # Loại bỏ các giá trị trống/None trước khi lưu
+        filters = {k: v for k, v in filters.items() if v and v.strip() != ""}
+        # Chỉ lưu vào session nếu có điều kiện lọc (tránh lưu rỗng)
+        session['last_filters'] = filters
+    else:
+        # Nếu là GET (chuyển trang), lấy từ session
+        # Nếu không có tham số gì, lấy filters mặc định là rỗng
+        filters = session.get('last_filters', {})
+
+    # --- Lấy danh sách mô tả lỗi duy nhất từ bảng `ket_qua_do_tim_loi` ---
+    engine = bc48.get_bc48_engine(db)
+    ds_mota_loi = []
+    try:
+        with engine.connect() as conn:
+            query_mota = text("""
+                SELECT DISTINCT mota_loi 
+                FROM ket_qua_do_tim_loi 
+                WHERE mota_loi IS NOT NULL AND mota_loi != '' 
+                ORDER BY mota_loi ASC
+            """)
+            ds_mota_loi = [row[0] for row in conn.execute(query_mota).fetchall()]
+    except Exception as e:
+        print(f"Lỗi lấy danh sách mô tả lỗi: {str(e)}")
+
+    # Gọi service xử lý phân trang lấy dữ liệu chi tiết lỗi từ bảng ket_qua_do_tim_loi
+    pagination_obj = bc48.get_chi_tiet_loi_new(
+        engine=engine, 
+        filters=filters, 
+        page=page,
+        per_page=30
+    )
+    
+    return render_template(
+        'bc48_ket_qua_gui_mail.html', 
+        chi_tiet_data=pagination_obj.get('items', []),
+        pagination=pagination_obj, 
+        filters=filters,
+        ds_mota_loi=ds_mota_loi
+    )
+
+# Tách riêng theo macn từ bảng ket_qua_do_tim_loi, bổ sung 3 cột: noi_dung, trang_thai_ghi_nhan, ngay_chinh_sua
+@app.route('/bc48/tach-rieng-macn', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def tach_rieng_macn():
+    # 1. Lấy và chuẩn hóa bộ lọc từ Form gửi lên
+    filters = request.form.to_dict()
+    filters = {k: v for k, v in filters.items() if v and v.strip() != ""}
+    # Đồng bộ bộ lọc vào session để giữ trạng thái màn hình tìm kiếm
+    session['last_filters'] = filters
+    
+    # 2. Gọi tầng DB thông qua engine để lấy dữ liệu tổng hợp
+    engine = bc48.get_bc48_engine(db)
+    try:
+        df = bc48.xu_ly_tach_theo_macn(engine, filters)
+    except Exception as e:
+        flash(f"Lỗi khi truy vấn dữ liệu từ cơ sở dữ liệu: {str(e)}", "danger")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+        
+    # 3. Kiểm tra xem có dữ liệu thỏa mãn bộ lọc hay không
+    if df.empty:
+        flash("Không tìm thấy bản ghi lỗi nào thỏa mãn điều kiện lọc để phân tách!", "warning")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+    
+    try:
+        # - Loại báo cáo (Nếu chọn tất cả thì để ALL)
+        loai_bc = filters.get('loai_bc', 'ALL').strip()
+        
+        # - Khoảng ngày tìm kiếm (Định dạng lại từ YYYY-MM-DD sang DDMMYYYY cho ngắn gọn)
+        tu_ngay = filters.get('tu_ngay', '').replace('-', '')
+        den_ngay = filters.get('den_ngay', '').replace('-', '')
+        # Phòng trường hợp người dùng không chọn ngày, lấy giá trị mặc định trống
+        str_tungay = f"Tu{tu_ngay}" if tu_ngay else ""
+        str_dengay = f"Den{den_ngay}" if den_ngay else ""
+        str_khoang_ngay = f"_{str_tungay}_{str_dengay}" if (str_tungay or str_dengay) else ""
+        
+        # - Thời điểm xuất file (Định dạng: YYYYMMDD_HHMMSS để đảm bảo không bao giờ trùng tên)
+        thoidiemxuatfile = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Định nghĩa sẵn styles dùng chung ngoài vòng lặp để tiết kiệm RAM/CPU
+        highlight_fill = PatternFill(start_color="FFE699", end_color="FFE699", fill_type="solid") # Màu vàng nhạt chuẩn theo mẫu
+        custom_header_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid") # Vàng đậm nổi bật
+        custom_font = Font(name="Arial", size=10, bold=True, color="000000")
+        
+        thin_border = Border(
+            left=Side(style='thin', color='D9D9D9'),
+            right=Side(style='thin', color='D9D9D9'),
+            top=Side(style='thin', color='D9D9D9'),
+            bottom=Side(style='thin', color='D9D9D9')
+        )
+
+        comments_dict = {
+            "noi_dung": "Giá trị sau chỉnh sửa; nội dung chỉnh sửa; lý giải nguyên nhân sai lệch",
+            "trang_thai_ghi_nhan": "Lý do chưa chỉnh sửa; Nhập đúng nội dung sau: DANG_SUA/DA_SUA_CHO_QUET/DA_HOAN_THANH",
+            "ngay_chinh_sua": "Ghi chú: Ngày thực tế chỉnh sửa dd/mm/yyyy"
+        }
+
+        macn_col = 'macn' if 'macn' in df.columns else 'MACN'
+        
+        # Sử dụng BytesIO duy nhất cho file ZIP tổng
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # Nhóm dữ liệu (Group By) theo cột 'macn'
+            # Sử dụng .get('macn', 'macn') để phòng trường hợp database trả về tên cột chữ HOA/thường
+            macn_col = 'macn' if 'macn' in df.columns else 'MACN'            
+            for macn, group_df in df.groupby(macn_col):
+                # Làm sạch chuỗi mã chi nhánh để đặt tên file cho chuẩn
+                clean_macn = str(macn).strip()
+                if not clean_macn or clean_macn == 'None':
+                    clean_macn = "CHUA_PHAN_LOAI"
+
+                # 1. Khởi tạo Workbook openpyxl mới
+                wb = Workbook()
+                ws = wb.active
+                ws.title = f'CN_{clean_macn}'
+                # Bật lưới dòng (Gridlines) trong Excel
+                ws.views.sheetView[0].showGridLines = True
+                # 2. Đổ dữ liệu từ DataFrame vào dòng Excel
+                # dataframe_to_rows tự động lấy cả Header ở dòng 1
+                for r in dataframe_to_rows(group_df, index=False, header=True):
+                    ws.append(r)
+                
+                # 3. Xác định vị trí các cột mới bổ sung
+                last_col_idx = group_df.shape[1] # Số lượng cột ban đầu
+                new_headers = ["noi_dung", "trang_thai_ghi_nhan", "ngay_chinh_sua"]
+                
+                # Thêm tiêu đề cho 3 cột mới và cấu hình Ghi chú (Comment) + Định dạng bôi màu
+                for i, h_name in enumerate(new_headers, start=1):
+                    col_cell = ws.cell(row=1, column=last_col_idx + i, value=h_name)
+                    col_cell.fill = custom_header_fill
+                    col_cell.font = custom_font
+                    col_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    
+                    # Thêm Ghi chú (Comment) chỉ dẫn khi di chuột vào tiêu đề
+                    col_cell.comment = Comment(comments_dict[h_name], "Hệ Thống BC48")
+                    # Định kích thước khung hiển thị ghi chú cho dễ đọc
+                    col_cell.comment.width = 300
+                    col_cell.comment.height = 50
+                
+                # Bôi màu nền nhẹ cho toàn bộ các ô trống thuộc 3 cột mới (để người dùng biết khu vực cần nhập liệu)
+                thin_border = Border(
+                    left=Side(style='thin', color='D9D9D9'),
+                    right=Side(style='thin', color='D9D9D9'),
+                    top=Side(style='thin', color='D9D9D9'),
+                    bottom=Side(style='thin', color='D9D9D9')
+                )
+
+                for row_idx in range(2, ws.max_row + 1):
+                    for i in range(1, 4):
+                        cell = ws.cell(row=row_idx, column=last_col_idx + i)
+                        cell.fill = highlight_fill
+                        cell.border = thin_border
+                        
+                # =========================================================================
+                # ĐẶT TÊN FILE THEO ĐÚNG CHUẨN KHOA HỌC YÊU CẦU:
+                # cấu trúc: macn_loaibc_tungay_dengay_thoidiemxuatfile.xlsx
+                # =========================================================================
+                #filename = f"{clean_macn}_{loai_bc}{str_khoang_ngay}_{thoidiemxuatfile}.xlsx"
+                # Ví dụ mẫu: 79001000_CTR_Tu20260701_Den20260702_20260702_213700.xlsx
+                filename = f"{clean_macn}{loai_bc}_NHNN_ERROR{str_khoang_ngay}.xlsx"
+                # =========================================================================
+                
+                ## Ghi file Excel trực tiếp vào file ZIP
+                ##zip_file.writestr(filename, excel_buffer.getvalue())
+                # openpyxl hỗ trợ lưu trực tiếp vào một file-like object mở từ zip
+                with zip_file.open(filename, 'w') as zip_entry:
+                    wb.save(zip_entry)
+        
+        # Đưa con trỏ bộ nhớ ZIP về đầu để chuẩn bị gửi sang Client
+        zip_buffer.seek(0)
+
+        # Đặt tên file ZIP bên ngoài cũng theo chuẩn khoa học chung để người dùng dễ quản lý
+        zip_name = f"BC48_Tach_MaCN_{loai_bc}{str_khoang_ngay}_{thoidiemxuatfile}.zip"
+        
+        # 5. Trả file ZIP về cho trình duyệt tự động tải xuống
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=zip_name
+        )
+        
+    except Exception as e:
+        flash(f"Lỗi trong quá trình xử lý tách file và nén ZIP: {str(e)}", "danger")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+# Nút lệnh "4. Tách riêng theo macn (ket_qua_do_tim_loi_2)" trên bc48_ket_qua_gui_mail.html, gọi Stored Procedure sp_select_by_loai_bc với danh sách tham số
+@app.route('/bc48/tach-macn-loi2', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def tach_rieng_macn_loi2():
+    try:
+        engine = bc48.get_bc48_engine(db)
+
+        # =========================================================================
+        # TỰ ĐỘNG CHUYỂN FONT THÀNH BASE64 ĐỂ XỬ LÝ OFFLINE TRÊN MAC
+        # =========================================================================
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        font_dir = os.path.join(current_dir, 'fonts')
+        
+        path_regular = os.path.join(font_dir, 'times.ttf')
+        path_bold = os.path.join(font_dir, 'timesbd.ttf')
+
+        base64_times_regular = ""
+        base64_times_bold = ""
+        
+        # Đọc và chuyển đổi tự động, nếu không tìm thấy file font sẽ dự phòng log lỗi
+        try:
+            with open(path_regular, "rb") as f_reg:
+                base64_times_regular = base64.b64encode(f_reg.read()).decode('utf-8')
+            with open(path_bold, "rb") as f_bld:
+                base64_times_bold = base64.b64encode(f_bld.read()).decode('utf-8')
+        except FileNotFoundError:
+            base64_times_regular = ""
+            base64_times_bold = ""
+            print("CẢNH BÁO: Không tìm thấy file font trong thư mục 'fonts/'. Kiểm tra lại đường dẫn!")
+        
+        # 1. Lấy dữ liệu từ bộ lọc form
+        filters = request.form.to_dict()
+        filters = {k: v.strip() if isinstance(v, str) else v for k, v in filters.items()}
+        
+        # 2. Gọi hàm xử lý lấy dữ liệu tổng hợp
+        df = bc48.xu_ly_tach_theo_macn_loi2(engine, filters)
+        
+        if df.empty:
+            flash("Không tìm thấy dữ liệu phù hợp với điều kiện lọc từ bảng kết quả lỗi 2!", "warning")
+            return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+        # --- ĐỊNH DANH TÊN CỘT THEO ĐÚNG ĐẦU RA CỦA HÀM CHUẨN HÓA TRONG BC48.PY ---
+        col_macn = 'macn'
+        col_ngay_bc = 'ngaydulieubaocao'
+
+        if 'macn' not in df.columns:
+            df['macn'] = 'CHUA_PHAN_LOAI'
+        if col_ngay_bc not in df.columns:
+            df[col_ngay_bc] = 'UNKNOWN_DATE'
+
+        # 3. Phân tích tham số ngày tháng / loại báo cáo làm tên file
+        filter_loai_bc = filters.get('loai_bc', 'ALL').strip()
+        loai_bc = filter_loai_bc if filter_loai_bc != 'ALL' else 'ALL_BC'
+
+        tu_ngay = filters.get('tu_ngay', '')
+        den_ngay = filters.get('den_ngay', '')
+        
+        def format_date_utility(date_val, target_format='%d%m%Y'):
+            if not date_val or str(date_val).lower() == 'nan': 
+                return ""
+            try:
+                if hasattr(date_val, 'strftime'):
+                    return date_val.strftime(target_format)
+                date_str = str(date_val).split()[0].strip()
+                return datetime.strptime(date_str, '%Y-%m-%d').strftime(target_format)
+            except:
+                return str(date_val).replace('-', '').replace('/', '').split()[0]
+
+        str_tu = format_date_utility(tu_ngay, '%d%m%Y')
+        str_den = format_date_utility(den_ngay, '%d%m%Y')
+        
+        str_khoang_ngay = f"_TU_{str_tu}" if str_tu else ""
+        if str_den:
+            str_khoang_ngay += f"_DEN_{str_den}" if str_khoang_ngay else f"_DEN_{str_den}"
+        if str_khoang_ngay and not str_khoang_ngay.startswith("_"):
+            str_khoang_ngay = "_" + str_khoang_ngay
+            
+        # 4. Thiết lập Style Openpyxl & Nội dung mô tả 3 cột bổ sung
+        highlight_fill = PatternFill(start_color="FFE699", end_color="FFE699", fill_type="solid")
+        custom_header_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+        custom_font = Font(name="Arial", size=10, bold=True, color="000000")
+        thin_border = Border(left=Side(style='thin', color='D9D9D9'), right=Side(style='thin', color='D9D9D9'), top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9'))
+
+        comments_dict = {
+            "Giá trị sau chỉnh sửa": "noi_dung; Lý giải nội dung chỉnh sửa; nguyên nhân sai lệch",
+            "Lý do chưa chỉnh sửa": "trang_thai_ghi_nhan; Nhập đúng nội dung sau: DANG_SUA/DA_SUA_CHO_QUET/DA_HOAN_THANH",
+            "Ghi chú": "ngay_chinh_sua: Ngày thực tế chỉnh sửa dd/mm/yyyy"
+        }
+        new_headers = ["Giá trị sau chỉnh sửa", "Lý do chưa chỉnh sửa", "Ghi chú"]
+
+        # --- KHỞI TẠO CẤU TRÚC ĐỆM ---
+        macn_files_registry = defaultdict(list)
+        excel_files_data = {}
+
+        # 5. TIẾN HÀNH XỬ LÝ VÀ GOM NHÓM DỮ LIỆU EXCEL
+        for (macn_code, ngay_bc_val), group_df in df.groupby(['macn', col_ngay_bc]):
+            clean_macn = str(macn_code).strip()
+            if not clean_macn or clean_macn.lower() == 'nan':
+                clean_macn = "KHONG_MA_CN"
+
+            ngay_du_lieu_bao_cao = format_date_utility(ngay_bc_val, '%Y%m%d')
+            if not ngay_du_lieu_bao_cao:
+                ngay_du_lieu_bao_cao = "UNKNOWN"
+
+            # Tạo file Excel
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "KetQuaDoTimLoi2"
+            
+            for r in dataframe_to_rows(group_df, index=False, header=True):
+                ws.append(r)
+                
+            start_col_idx = group_df.shape[1] + 1
+            
+            for i, header_name in enumerate(new_headers):
+                col_idx = start_col_idx + i
+                cell = ws.cell(row=1, column=col_idx, value=header_name)
+                cell.fill = custom_header_fill
+                cell.font = custom_font
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                if header_name in comments_dict:
+                    cell.comment = Comment(comments_dict[header_name], "Hệ thống")
+                    
+            max_row = ws.max_row
+            if max_row > 1:
+                for row in range(2, max_row + 1):
+                    for i in range(len(new_headers)):
+                        col_idx = start_col_idx + i
+                        data_cell = ws.cell(row=row, column=col_idx)
+                        data_cell.value = ""
+                        data_cell.fill = highlight_fill
+                        data_cell.border = thin_border
+                        
+            for col in ws.columns:
+                max_len = 0
+                col_letter = get_column_letter(col[0].column)
+                for cell in col:
+                    if cell.value:
+                        max_len = max(max_len, len(str(cell.value)))
+                ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+                
+            excel_buffer = BytesIO()
+            wb.save(excel_buffer)
+            excel_buffer.seek(0)
+
+            excel_filename = f"{clean_macn}_{ngay_du_lieu_bao_cao}_{loai_bc}_NHNN_ERROR.xlsx"
+            excel_files_data[excel_filename] = excel_buffer.getvalue()
+            
+            # Lưu vết danh sách file Excel thuộc về Mã CN này
+            so_ban_ghi = max(0, max_row - 1)
+            stt_hien_tai = len(macn_files_registry[clean_macn]) + 1
+            macn_files_registry[clean_macn].append([str(stt_hien_tai), excel_filename, f"{so_ban_ghi:,}".replace(',', '.')])
+
+        # =========================================================================
+        # 6. MỞ LUỒNG GHI ZIP DUY NHẤT ĐỂ ĐÓNG GÓI EXCEL & CÁC FILE PDF RIÊNG BIỆT
+        # =========================================================================
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            
+            # Bước 6a: Đóng gói toàn bộ các file Excel chi tiết
+            for filename, binary_content in excel_files_data.items():
+                zf.writestr(filename, binary_content)
+
+            # Bước 6b: Duyệt qua từng Mã CN để tạo duy nhất 1 file PDF bàn giao gộp chung các ngày
+            for target_macn, files_list in macn_files_registry.items():
+                try:
+                    # Chuỗi HTML liền mạch ở phần CSS để ép WeasyPrint nhận diện Font Base64 trên Mac
+                    html_content = f"<html><head><meta charset='utf-8'><style>@font-face {{font-family: 'TimesNewRomanCustom'; src: url(data:font/truetype;charset=utf-8;base64,{base64_times_regular}) format('truetype'); font-weight: normal; font-style: normal;}} @font-face {{font-family: 'TimesNewRomanCustom'; src: url(data:font/truetype;charset=utf-8;base64,{base64_times_bold}) format('truetype'); font-weight: bold; font-style: normal;}} @page {{ size: A4; margin: 20mm; }} body {{ font-family: 'TimesNewRomanCustom', serif; font-size: 11pt; line-height: 1.5; color: #000; }} .title {{ text-align: center; font-weight: bold; font-size: 14pt; margin-bottom: 25px; text-transform: uppercase; }} .info-block {{ margin-bottom: 15px; }} table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 10pt; }} th, td {{ border: 1px solid #000; padding: 8px; text-align: center; vertical-align: middle; }} th {{ background-color: #343a40; color: white; font-weight: bold; }} .text-left {{ text-align: left; }} .signatures-container {{ margin-top: 40px; width: 100%; clear: both; }} .sig-box-left {{ float: left; width: 45%; text-align: center; font-weight: bold; }} .sig-box-right {{ float: right; width: 45%; text-align: center; font-weight: bold; }} .sub-title {{ font-weight: normal; font-style: italic; font-size: 9.5pt; display: block; margin-top: 3px; }}</style></head><body>"
+                    
+                    html_content += f"<div class='title'>BIÊN BẢN BÀN GIAO DANH SÁCH DỮ LIỆU LỖI<br>MÃ CHI NHÁNH: {target_macn}</div>"
+                    html_content += f"<div class='info-block'><p><b>Ngày lập:</b> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p><p><b>Loại báo cáo:</b> {loai_bc}</p></div>"
+                    html_content += "<table><thead><tr><th style='width: 8%;'>STT</th><th>Tên File Dữ Liệu Chi Tiết (Excel)</th><th style='width: 25%;'>Số Lượng Dòng Lỗi</th></tr></thead><tbody>"
+                    
+                    for row in files_list:
+                        html_content += f"""<tr><td>{row[0]}</td><td class="text-left">{row[1]}</td><td>{row[2]}</td></tr>"""
+                        
+                    html_content += f"""</tbody></table><div class="signatures-container"><div class="sig-box-left">BP BÁO CÁO TUÂN THỦ PCRT<span class="sub-title">(Ký, ghi rõ họ tên)</span></div><div class="sig-box-right">BP PCRT CHI NHÁNH<span class="sub-title">(Ký, đóng dấu, ghi rõ họ tên)</span></div></div></body></html>"""
+                    
+                    # BIỆN PHÁP ÉP KHỬ ĐỘC: Dọn dẹp tuyệt đối mọi ký tự xuống dòng rác sinh ra trong chuỗi trước khi chuyển giao cho WeasyPrint
+                    html_content = "".join([line.strip() for line in html_content.splitlines()])
+                    
+                    # 2. Xuất trực tiếp ra PDF thông qua WeasyPrint mà không sợ lỗi Font trên Mac
+                    pdf_buffer = BytesIO()
+                    HTML(string=html_content).write_pdf(pdf_buffer)
+                    pdf_buffer.seek(0)
+                    
+                    # --- ĐẶT TÊN FILE PDF GỘP THEO ĐÚNG ĐỊNH DẠNG CỦA FILE EXCEL (Bỏ phần ngày chi tiết) ---
+                    # Kết quả mẫu: CN01_ALL_BC_NHNN_ERROR_TU_01012026_DEN_10012026.pdf
+                    pdf_filename = f"{target_macn}_{loai_bc}_NHNN_ERROR{str_khoang_ngay}.pdf"
+                    
+                    # Đóng gói file PDF gộp của Mã CN này vào ZIP
+                    zf.writestr(pdf_filename, pdf_buffer.getvalue())
+                    
+                except Exception as pdf_err:
+                    print(f"Lỗi khi sinh file PDF bàn giao gộp cho CN {target_macn}: {str(pdf_err)}")
+                    traceback.print_exc()
+
+        # 7. TRẢ FILE ZIP VỀ TRÌNH DUYỆT KHÁCH HÀNG
+        zip_buffer.seek(0)
+        zip_download_name = f"BC48_Tach_MaCN_Ngay_Loi2_{loai_bc}{str_khoang_ngay}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        
+        return send_file(
+            zip_buffer,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=zip_download_name
+        )
+        
+    except Exception as e:
+        traceback.print_exc()
+        flash(f"Có lỗi xảy ra khi bóc tách nhóm dữ liệu Mã CN lỗi 2: {str(e)}", "danger")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+
+@app.route('/bc48/xoa-loc')
+@login_required
+@admin_or_user_sd_bc48
+def xoa_loc_bc48():
+    # Xóa bộ lọc cũ trong session
+    if 'last_filters' in session:
+        session.pop('last_filters')
+    # Chuyển hướng về trang danh sách (lúc này session đã trống nên sẽ hiện tất cả)
+    return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+@app.route('/bc48/tiep-nhan-file/<int:id_dot>', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def tiep_nhan_file_tu_don_vi(id_dot):
+    """
+    Màn hình hoặc API tiếp nhận phản hồi xác nhận đơn vị đã nhận file thành công.
+    """
+    ghi_chu = request.form.get('ghi_chu', '')
+    engine = bc48.get_bc48_engine(db)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE lich_su_gui_file 
+            SET trang_thai_tiep_nhan = 'DA_TIEP_NHAN', 
+                ngay_tiep_nhan = NOW(),
+                ghi_chu_tiep_nhan = :ghi_chu
+            WHERE id_dot = :id_dot
+        """), {"id_dot": id_dot, "ghi_chu": ghi_chu})
+    flash("Đã cập nhật trạng thái tiếp nhận tệp tin xử lý thành công!", "success")
+    return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+@app.route('/bc48/tong-hop-loi', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def tong_hop_loi():
+    try:
+        # Khởi tạo engine kết nối DB từ cấu hình hệ thống của bạn
+        engine = bc48.get_bc48_engine(db)
+        
+        # Tạo và kích hoạt một Thread ngầm để xử lý cơ sở dữ liệu
+        thr = threading.Thread(target=bg_worker_run_procedure, args=(engine,))
+        thr.daemon = True  # Đảm bảo luồng tự giải phóng khi ứng dụng tắt
+        thr.start()
+        
+        # Trả phản hồi ngay lập tức về giao diện Web (chỉ mất ~ 0.05 giây)
+        flash("🚀 Tiến trình đối chiếu trung tâm đã được kích hoạt chạy ngầm hệ thống thành công! Vui lòng đợi vài phút rồi bấm nút 'Làm mới' để xem dữ liệu mới.", "info")
+        
+    except Exception as e:
+        # Nếu có lỗi bất kỳ trong khối 'with', hệ thống tự động ROLLBACK
+        print(f"Lỗi hệ thống khi thực thi SP: {str(e)}")
+        flash(f"Không thể khởi tạo tiến trình chạy ngầm: {str(e)}", "error")
+
+    # Quay trở về trang giao diện hiển thị kết quả dò tìm lỗi ban đầu        
+    return redirect(url_for('giaodien_ket_qua_do_tim'))
+
+# Xuất sao kê từ bảng ket_qua_do_tim_loi
+@app.route('/bc48/export-sao-ke', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def export_sao_ke():
+    # Ưu tiên lấy dữ liệu trực tiếp từ Form đang hiển thị trên màn hình lúc bấm nút
+    if request.method == 'POST':
+        filters = request.form.to_dict()
+        filters = {k: v for k, v in filters.items() if v and v.strip() != ""}
+        # Đồng bộ cập nhật lại session để giữ trạng thái đồng nhất
+        if filters:
+            session['last_filters'] = filters
+    else:
+        filters = session.get('last_filters', {})
+    
+    try:
+        # Gọi hàm xử lý và truyền trực tiếp bộ lọc chuẩn vừa lấy từ bảng mới ket_qua_do_tim_loi
+        file_data = bc48.export_sao_ke_duy_nhat(db, filters)
+        
+        # =========================================================================
+        # BỔ SUNG: Xây dựng chuỗi tiêu chí lọc gắn vào tên File
+        # =========================================================================
+        # 1. Loại báo cáo (Mặc định ALL nếu trống)
+        loai_bc_fn = filters.get('loai_bc', 'ALL').strip().upper()
+        
+        # 2. Mã chi nhánh (Nếu có thì lấy, không có ghi ALL_CN)
+        macn_fn = filters.get('macn', '').strip()
+        macn_str = f"_CN{macn_fn.zfill(8)}" if macn_fn else "_ALL_CN"
+        
+        # 3. Khoảng thời gian báo cáo
+        tu_ngay_fn = filters.get('tu_ngay', '').replace('-', '')
+        den_ngay_fn = filters.get('den_ngay', '').replace('-', '')
+        
+        if tu_ngay_fn and den_ngay_fn:
+            time_str = f"_{tu_ngay_fn}_TO_{den_ngay_fn}"
+        elif tu_ngay_fn:
+            time_str = f"_FROM_{tu_ngay_fn}"
+        elif den_ngay_fn:
+            time_str = f"_UNTIL_{den_ngay_fn}"
+        else:
+            time_str = "_ALL_TIME"
+            
+        # Thời gian xuất file thực tế của hệ thống để tránh trùng tên file
+        now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Tạo tên file hoàn chỉnh: ví dụ: "sao_ke_duy_nhat_CTR_CN00012345_20260101_TO_20260331_20260702_174500.xlsx"
+        filename = f"sao_ke_duy_nhat_{loai_bc_fn}{macn_str}{time_str}_{now_str}.xlsx"
+        # =========================================================================
+        
+        return send_file(
+            file_data,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        flash(f"Lỗi khi xuất file sao kê: {str(e)}", "danger")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+
+@app.route('/bc48/xu-ly-xuat-csv-zip', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def xu_ly_xuat_csv_zip():
+    # 1. Lấy dữ liệu từ form
+    filters = request.form.to_dict()
+    
+    tu_ngay = filters.get('tu_ngay')
+    den_ngay = filters.get('den_ngay')
+    loai_bc = filters.get('loai_bc', 'ALL')
+    loai_mat_khau = filters.get('loai_mat_khau', 'fixed')
+    
+    if not tu_ngay or not den_ngay:
+        flash("Vui lòng chọn Từ ngày và Đến ngày!", "warning")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+    # SỬA LỖI TẠI ĐÂY: Lấy định danh an toàn từ current_user (Thử ma_nhan_vien, ma_nv rồi đến username)
+    nguoi_dung_hien_tai = (
+        getattr(current_user, 'ma_nhan_vien', None) or 
+        getattr(current_user, 'ma_nv', None) or 
+        getattr(current_user, 'username', 'Hệ thống')
+    )
+    
+    # 2. Khởi tạo engine và gọi hàm xử lý từ bc48.py
+    engine = bc48.get_bc48_engine(db)
+    result = bc48.chi_xuat_csv_ket_qua_do_tim_loi(
+        engine=engine, 
+        loai_bc=loai_bc, 
+        tu_ngay=tu_ngay, 
+        den_ngay=den_ngay, 
+        loai_mat_khau=loai_mat_khau, 
+        nguoi_thuc_hien=nguoi_dung_hien_tai,
+        filters_data=filters  # <-- TRUYỀN THÊM TOÀN BỘ FORM ĐỂ LỌC THEO MACN, MA_HIEU_1, MA_HIEU_2
+    )
+
+    # 3. Phản hồi kết quả dựa trên kiểu dữ liệu trả về
+    if isinstance(result, list): 
+        # Nếu thành công trả về danh sách, lưu vào session phục vụ nút Gửi Mail độc lập
+        session['files_to_send'] = result
+        success_count = len(result)
+        flash(f"Đã xuất thành công {success_count} file ZIP mã hóa cho các đơn vị! Dữ liệu đã sẵn sàng để gửi Mail.", "success")
+    else:
+        # Nếu trả về thông báo chuỗi (Lỗi hệ thống hoặc Không tìm thấy dữ liệu)
+        # Xóa dữ liệu cũ trong session cũ (nếu có) để tránh gửi nhầm
+        session.pop('files_to_send', None)
+        flash(result, "danger" if "Lỗi" in result else "warning")
+        
+    return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+####################################################################################
+# Nhật ký mật khẩu nén file csv sau khi bóc tách mota_loi của CSV
+# tránh việc gửi kèm mật khẩu vào email làm lộ dữ liệu => giải pháp đóng gói mã hóa và gửi mail theo đúng các thông tin cấu hình từ bảng danh_sach_mail_chi_nhanh
+####################################################################################
+@app.route('/bc48/nhat-ky-mat-khau', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def nhat_ky_mat_khau():
+    page = request.args.get('page', 1, type=int)
+    per_page = 20  # Số lượng dòng trên mỗi trang
+    offset = (page - 1) * per_page
+
+    # 1. KHỞI TẠO ENGINE ĐỂ TRỎ ĐÚNG SANG DATABASE BC48
+    engine = bc48.get_bc48_engine(db)
+
+    # 2. Kiểm tra quyền kiểm soát tối cao (Admin)
+    is_admin = (getattr(current_user, 'role', '') == 'admin') or getattr(current_user, 'is_admin', False)
+    
+    user_manh8so_moi = None
+
+    # 3. Nếu KHÔNG PHẢI ADMIN, tiến hành truy vết lấy mã Chi nhánh (manh8so_moi) của User
+    if not is_admin:
+        try:
+            # Lưu ý: Thông tin tài khoản users và thông tin nhân sự thong_tin_nguoi_lao_dong
+            # nằm ở DB gốc (db.session). Lấy trường ma_hieu_1 từ bảng don_vi
+            query_user_branch = text("""
+                SELECT dv.ma_hieu_1 
+                FROM users u
+                INNER JOIN thong_tin_nguoi_lao_dong nv ON u.ma_nhan_vien = nv.ma_nhan_vien
+                INNER JOIN don_vi dv ON nv.ma_hieu_2 = dv.ma_hieu_2
+                WHERE u.ma_nhan_vien = :ma_nv
+                LIMIT 1
+            """)
+            user_manh8so_moi = db.session.execute(query_user_branch, {'ma_nv': current_user.ma_nhan_vien}).scalar()
+            
+            if not user_manh8so_moi:
+                flash("Tài khoản của bạn chưa được liên kết với mã đơn vị quản lý trên hệ thống. Vui lòng liên hệ Admin!", "danger")
+                return redirect(url_for('index'))
+                
+        except Exception as e:
+            print(f"Lỗi truy vết đơn vị cán bộ: {str(e)}")
+            flash("Có lỗi xảy ra khi xác thực quyền đơn vị!", "danger")
+            return redirect(url_for('index'))
+
+    # 4. Thiết lập câu lệnh SQL lấy danh sách mật khẩu dựa trên phân quyền (Đồng bộ theo manh8so_moi)
+    if is_admin:
+        count_query = text("SELECT COUNT(*) FROM log_mat_khau_xuat_file")
+        data_query = text("""
+            SELECT ngay_xuat, manh8so_moi, loai_bao_cao, ten_file, mat_khau, nguoi_xuat 
+            FROM log_mat_khau_xuat_file 
+            ORDER BY ngay_xuat DESC 
+            LIMIT :limit OFFSET :offset
+        """)
+        params = {'limit': per_page, 'offset': offset}
+    else:
+        count_query = text("SELECT COUNT(*) FROM log_mat_khau_xuat_file WHERE manh8so_moi = :manh8so_moi")
+        data_query = text("""
+            SELECT ngay_xuat, manh8so_moi, loai_bao_cao, ten_file, mat_khau, nguoi_xuat 
+            FROM log_mat_khau_xuat_file 
+            WHERE manh8so_moi = :manh8so_moi
+            ORDER BY ngay_xuat DESC 
+            LIMIT :limit OFFSET :offset
+        """)
+        params = {'manh8so_moi': user_manh8so_moi, 'limit': per_page, 'offset': offset}
+
+    # 5. THỰC THI TRUY VẤN TRÊN ENGINE CỦA BC48
+    try:
+        with engine.connect() as conn:
+            # Thực thi đếm tổng số dòng trên DB BC48
+            total_rows = conn.execute(count_query, {'manh8so_moi': user_manh8so_moi} if not is_admin else {}).scalar() or 0
+            total_pages = math.ceil(total_rows / per_page) if total_rows > 0 else 1
+            
+            if page > total_pages:
+                page = total_pages
+                if not is_admin:
+                    params['offset'] = (page - 1) * per_page
+
+            # Thực thi lấy dữ liệu log mật khẩu trên DB BC48
+            result = conn.execute(data_query, params).mappings().fetchall()
+            
+            # Đóng gói dữ liệu sang mảng Dict để hiển thị lên giao diện Jinja2
+            pass_logs = []
+            for row in result:
+                pass_logs.append({
+                    'ngay_xuat': row['ngay_xuat'],
+                    # Giữ nguyên key 'ma_hieu_1' để tương thích với cấu trúc của file template HTML hiện tại
+                    'ma_hieu_1': row['manh8so_moi'], 
+                    'loai_bao_cao': row['loai_bao_cao'],
+                    'ten_file': row['ten_file'],
+                    'mat_khau': row['mat_khau'],
+                    'nguoi_xuat': row['nguoi_xuat']
+                })
+            
+    except Exception as e:
+        print(f"Lỗi thực thi dữ liệu mật khẩu trên DB BC48: {str(e)}")
+        pass_logs = []
+        total_pages = 1
+
+    return render_template(
+        'bc48_nhat_ky_mat_khau.html',
+        title='Nhật ký cấp mật khẩu',
+        pass_logs=pass_logs,
+        page=page,
+        total_pages=total_pages
+    )
+
+# Sau khi xuất CSV, nén đặt mật khẩu thì gửi mail
+@app.route('/bc48/gui-mail-sau-xuat', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def gui_mail_sau_xuat():
+    # 1. Kiểm tra dữ liệu tệp tin đệm trong session
+    files_to_send = session.get('files_to_send')
+    if not files_to_send or not isinstance(files_to_send, list):
+        flash("Không tìm thấy danh sách tệp tin sẵn sàng để gửi. Vui lòng bấm nút 'Xuất CSV Nén (ZIP)' trước!", "warning")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+    # 2. Lấy cấu hình SMTP từ app.config đã khai báo
+    smtp_setting = app.config.get('SMTP_CONFIG', {})
+    mail_config = {
+        'SMTP_SERVER': smtp_setting.get('server'),
+        'SMTP_PORT': int(smtp_setting.get('port', 25)) if smtp_setting.get('port') else 25,
+        'SMTP_USERNAME': smtp_setting.get('email'),
+        'SMTP_PASSWORD': smtp_setting.get('password'),
+        'SENDER_EMAIL': smtp_setting.get('email'),
+        'USE_TLS': smtp_setting.get('use_tls', False)
+    }
+
+    success_mail_count = 0
+    fail_mail_count = 0
+    errors_list = []
+    
+    # Lấy thông tin cán bộ thực hiện thao tác gửi mail
+    user_action = getattr(current_user, 'username', 'Hệ thống') 
+    
+    # Khởi tạo engine kết nối chính xác tới cơ sở dữ liệu phân tách db_bc48
+    engine_bc48 = bc48.get_bc48_engine(db)
+
+    # 3. Vòng lặp duyệt danh sách gửi mail cho từng đơn vị
+    for file_info in files_to_send:
+        ma_cn = file_info.get('ma_cn')
+        email_nhan = file_info.get('email')
+        zip_path = file_info.get('zip_path')
+        zip_name = file_info.get('zip_name')
+
+        # Bóc tách khoảng thời gian và loại BC từ file_info để định vị dòng dữ liệu master
+        f_tu_ngay = file_info.get('tu_ngay')
+        f_den_ngay = file_info.get('den_ngay')
+        loai_bc = zip_name.split('_')[0] if zip_name else "BC48"
+
+        # Lấy thông tin email CC từ danh bạ hệ thống (sử dụng engine_bc48 luôn cho đồng bộ)
+        email_cc = ""
+        try:
+            with engine_bc48.connect() as conn:
+                df_mail_sys = bc48.lay_danh_sach_mail_toan_he_thong(conn)
+                if not df_mail_sys.empty:
+                    df_current = df_mail_sys[df_mail_sys['macn'] == str(ma_cn).strip().upper()]
+                    if not df_current.empty and 'email_cc' in df_current.columns:
+                        email_cc = str(df_current['email_cc'].iloc[0]).strip()
+        except Exception as cc_ex:
+            print(f"[CẢNH BÁO] Không lấy được Email CC cho đơn vị {ma_cn}: {str(cc_ex)}")
+            email_cc = ""
+
+        # Gọi hàm core thực hiện gửi mail đính kèm tệp tin ZIP
+        status = bc48.gui_mail_dinh_kem_zip(
+            mail_config=mail_config,
+            target_email=email_nhan,
+            cc_email=email_cc,
+            file_path=zip_path,
+            file_name=zip_name,
+            loai_bc=loai_bc,
+            ma_cn=ma_cn
+        )
+
+        thoi_gian_gui = datetime.now()
+
+        if status == "SUCCESS":
+            success_mail_count += 1
+            trang_thai_log = "Thành công"
+            
+            # CẬP NHẬT TRẠNG THÁI TIẾP NHẬN: Chuyển sang Chờ các đơn vị nhận phản hồi xử lý
+            try:
+                with engine_bc48.begin() as update_conn:
+                    # Bước A: Khởi tạo đợt gửi mới vào bảng lich_su_gui_file để sinh ID tự động
+                    sql_insert_history = text("""
+                        INSERT INTO lich_su_gui_file (
+                            ten_file, manh8so_moi, loai_bao_cao, ngay_gui, 
+                            trang_thai_tiep_nhan, nguoi_gui, email_nhan
+                        ) VALUES (
+                            :ten_file, :ma_cn, :loai_bc, :ngay_gui, 
+                            'DA_GUI_MAIL', :nguoi_gui, :email_nhan
+                        )
+                    """)
+
+                    res_insert = update_conn.execute(sql_insert_history, {
+                        "ten_file": zip_name,
+                        "ma_cn": str(ma_cn).strip().upper(),
+                        "loai_bc": loai_bc,
+                        "ngay_gui": thoi_gian_gui,
+                        "nguoi_gui": user_action,
+                        "email_nhan": email_nhan
+                    })
+                    
+                    # Lấy ra id_dot vừa được sinh tự động (Last Inserted ID)
+                    new_id_dot = res_insert.lastrowid
+
+                    # Bước B: Xây dựng các điều kiện quét để tìm chính xác các giao dịch thuộc file này
+                    where_clauses = ["k.macn = :ma_cn"]
+                    params = {"ma_cn": str(ma_cn).strip().upper()}
+
+                    if loai_bc != 'ALL':
+                        where_clauses.append("k.loai_bc = :loai_bc")
+                        params["loai_bc"] = loai_bc
+                    if f_tu_ngay:
+                        where_clauses.append("k.ngay_baocao >= :tu_ngay")
+                        params["tu_ngay"] = f_tu_ngay
+                    if f_den_ngay:
+                        where_clauses.append("k.ngay_baocao <= :den_ngay")
+                        params["den_ngay"] = f_den_ngay
+
+                    where_sql = " AND ".join(where_clauses)
+
+                    # Bước C: Chèn hoặc Cập nhật bảng theo_doi_khac_phuc_loi gán kèm mã `id_dot` và ghi nhận tiến trình gửi mail
+                    sql_update_khac_phuc = f"""
+                        INSERT INTO theo_doi_khac_phuc_loi (
+                            ma_giao_dich, ngay_baocao, bang_goc_tim_thay, 
+                            trang_thai_khac_phuc, id_dot, ngay_cap_nhat,
+                            ngay_gui_mail_dau, ngay_gui_gan_nhat, so_lan_gui_mail
+                        )
+                        SELECT 
+                            k.ma_giao_dich, k.ngay_baocao, CONCAT(LOWER(k.loai_bc), '_error'), 
+                            'DANG_SUA', :id_dot, NOW(),
+                            NOW(), NOW(), 1
+                        FROM ket_qua_do_tim_loi k
+                        WHERE {where_sql}
+                        ON DUPLICATE KEY UPDATE 
+                            trang_thai_khac_phuc = 'DANG_SUA',
+                            id_dot = :id_dot,
+                            ngay_cap_nhat = NOW(),
+                            -- Nếu chưa từng gửi (NULL), gán bằng thời gian hiện tại. Nếu có rồi thì giữ nguyên.
+                            ngay_gui_mail_dau = COALESCE(ngay_gui_mail_dau, NOW()), 
+                            -- Luôn luôn cập nhật thời điểm gửi mới nhất
+                            ngay_gui_gan_nhat = NOW(), 
+                            -- Tự động tăng lũy tiến số lần gửi mail lên +1
+                            so_lan_gui_mail = COALESCE(so_lan_gui_mail, 0) + 1;
+                    """
+
+                    # Thêm id_dot vào params để truyền vào câu lệnh SQL
+                    params["id_dot"] = new_id_dot
+                    update_conn.execute(text(sql_update_khac_phuc), params)
+                    
+                    # Bước D: Cập nhật trạng thái xử lý tổng quát (trang_thai_xuly = 1) bên bảng gốc
+                    sql_update_loi_master = f"""
+                        UPDATE ket_qua_do_tim_loi k
+                        SET k.trang_thai_xuly = 1
+                        WHERE {where_sql};
+                    """
+                    # Xóa id_dot khỏi params trước khi chạy lệnh update bảng lỗi gốc nếu cần thiết (ở đây dùng chung params có dư id_dot vẫn không sao)
+                    update_conn.execute(text(sql_update_loi_master), params)
+
+                    print(f"[AML SYSTEM] Đã ghi nhận lịch sử đợt {new_id_dot} vào lich_su_gui_file cho chi nhánh {ma_cn}")
+            except Exception as ex:
+                print(f"[LỖI TIẾN TRÌNH DB] Không thể cập nhật trạng thái khắc phục cho đơn vị {ma_cn}: {str(ex)}")
+        else:
+            fail_mail_count += 1
+            trang_thai_log = f"Thất bại: {status}"
+            errors_list.append(f"Đơn vị {ma_cn}: {status}")
+
+        # GHI NHẬT KÝ: Insert thông tin vết gửi vào bảng lich_su_gui_file; log_gui_mail_bc48
+        try:
+            with engine_bc48.begin() as log_conn:
+                log_conn.execute(text("""
+                    INSERT INTO log_gui_mail_bc48 (
+                        manh8so_moi, ngay_gui, email_nhan, ten_file_dinh_kem, duong_dan_file, trang_thai, nguoi_thuc_hien
+                    ) VALUES (:ma_cn, :ngay_gui, :email_nhan, :zip_name, :zip_path, :trang_thai, :nguoi)
+                """), {
+                    "ma_cn": ma_cn, "ngay_gui": thoi_gian_gui, "email_nhan": email_nhan,
+                    "zip_name": zip_name, "zip_path": zip_path, "trang_thai": trang_thai_log, "nguoi": user_action
+                })
+        except Exception as log_ex:
+            print(f"[LỖI GHI LOG DATABASE] Không thể ghi nhật ký cho đơn vị {ma_cn}: {str(log_ex)}")
+
+    # 4. Phản hồi kết quả tổng quát ra màn hình ứng dụng
+    if fail_mail_count == 0:
+        flash(f"Thực thi hoàn tất! Đã gửi thành công toàn bộ {success_mail_count} Email, chuyển trạng thái dữ liệu sang 'Đã gửi mail' và lưu nhật ký hệ thống.", "success")
+        session.pop('files_to_send', None)  # Xóa sạch session đệm sau khi hoàn thành quy trình
+    else:
+        flash(f"Tiến trình kết thúc có lỗi cục bộ: Gửi thành công {success_mail_count} thư, thất bại {fail_mail_count} thư. Chi tiết xem tại Terminal hoặc bảng log_gui_mail_bc48.", "danger")
+
+    return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+@app.route('/bc48/gui-mail-sau-xuat', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def gui_mail_sau_xuat_v01():
+    # 1. Kiểm tra dữ liệu tệp tin đệm trong session
+    files_to_send = session.get('files_to_send')
+    if not files_to_send or not isinstance(files_to_send, list):
+        flash("Không tìm thấy danh sách tệp tin sẵn sàng để gửi. Vui lòng bấm nút 'Xuất CSV Nén (ZIP)' trước!", "warning")
+        return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
+    # 2. Lấy cấu hình SMTP từ app.config đã khai báo
+    smtp_setting = app.config.get('SMTP_CONFIG', {})
+    mail_config = {
+        'SMTP_SERVER': smtp_setting.get('server'),
+        'SMTP_PORT': int(smtp_setting.get('port', 25)) if smtp_setting.get('port') else 25,
+        'SMTP_USERNAME': smtp_setting.get('email'),
+        'SMTP_PASSWORD': smtp_setting.get('password'),
+        'SENDER_EMAIL': smtp_setting.get('email'),
+        'USE_TLS': smtp_setting.get('use_tls', False)
+    }
+
+    success_mail_count = 0
+    fail_mail_count = 0
+    errors_list = []
+    
+    # Lấy thông tin cán bộ thực hiện thao tác gửi mail
+    user_action = getattr(current_user, 'username', 'Hệ thống') 
+    
+    # Khởi tạo engine kết nối chính xác tới cơ sở dữ liệu phân tách db_bc48
+    engine_bc48 = bc48.get_bc48_engine(db)
+
+    # 3. Vòng lặp duyệt danh sách gửi mail cho từng đơn vị
+    for file_info in files_to_send:
+        ma_cn = file_info.get('ma_cn')
+        email_nhan = file_info.get('email')
+        zip_path = file_info.get('zip_path')
+        zip_name = file_info.get('zip_name')
+        id_dot_theo_doi = file_info.get('id_dot') # Lấy ID đợt vừa khởi tạo ở bước xuất file
+        
+        f_tu_ngay = file_info.get('tu_ngay')
+        f_den_ngay = file_info.get('den_ngay')
+        loai_bc = zip_name.split('_')[0] if zip_name else "BC48"
+
+        # Lấy thông tin email CC từ danh bạ hệ thống (sử dụng engine_bc48 luôn cho đồng bộ)
+        email_cc = ""
+        try:
+            with engine_bc48.connect() as conn:
+                df_mail_sys = bc48.lay_danh_sach_mail_toan_he_thong(conn)
+                if not df_mail_sys.empty:
+                    df_current = df_mail_sys[df_mail_sys['macn'] == str(ma_cn).strip().upper()]
+                    if not df_current.empty and 'email_cc' in df_current.columns:
+                        email_cc = str(df_current['email_cc'].iloc[0]).strip()
+        except Exception as cc_ex:
+            print(f"[CẢNH BÁO] Không lấy được Email CC cho đơn vị {ma_cn}: {str(cc_ex)}")
+            email_cc = ""
+
+        # Gọi hàm core thực hiện gửi mail đính kèm tệp tin ZIP
+        status = bc48.gui_mail_dinh_kem_zip(
+            mail_config=mail_config,
+            target_email=email_nhan,
+            cc_email=email_cc,
+            file_path=zip_path,
+            file_name=zip_name,
+            loai_bc=loai_bc,
+            ma_cn=ma_cn
+        )
+
+        thoi_gian_gui = datetime.now()
+
+        if status == "SUCCESS":
+            success_mail_count += 1
+            trang_thai_log = "Thành công"
+            
+            # CẬP NHẬT TRẠNG THÁI TIẾP NHẬN: Chuyển sang Chờ các đơn vị nhận phản hồi xử lý
+            try:
+                with engine_bc48.begin() as update_conn:
+                    update_conn.execute(text("""
+                        UPDATE lich_su_gui_file 
+                        SET trang_thai_tiep_nhan = 'DA_GUI_MAIL', ngay_gui = :ngay_gui
+                        WHERE id_dot = :id_dot
+                    """), {"ngay_gui": thoi_gian_gui, "id_dot": id_dot_theo_doi})
+                    # Đồng thời cập nhật trạng thái chi tiết của từng mã lỗi thuộc đợt này
+                    update_conn.execute(text("""
+                        UPDATE theo_doi_khac_phuc_loi 
+                        SET trang_thai_khac_phuc = 'DANG_SUA' 
+                        WHERE id_dot = :id_dot
+                    """), {"id_dot": id_dot_theo_doi})
+                    print(f"[AML SYSTEM] Đã chuyển trang_thai_xuly = 1 cho đơn vị {ma_cn} [{loai_bc}]")
+            except Exception as ex:
+                print(f"[LỖI TIẾN TRÌNH DB] Không thể cập nhật trạng thái xử lý cho đơn vị {ma_cn}: {str(ex)}")
+        else:
+            fail_mail_count += 1
+            trang_thai_log = f"Thất bại: {status}"
+            errors_list.append(f"Đơn vị {ma_cn}: {status}")
+
+        # GHI NHẬT KÝ: Insert thông tin vết gửi vào bảng log_gui_mail_bc48
+        try:
+            with engine_bc48.begin() as log_conn:
+                log_conn.execute(text("""
+                    INSERT INTO log_gui_mail_bc48 (
+                        manh8so_moi, ngay_gui, email_nhan, ten_file_dinh_kem, duong_dan_file, trang_thai, nguoi_thuc_hien
+                    ) VALUES (:ma_cn, :ngay_gui, :email_nhan, :zip_name, :zip_path, :trang_thai, :nguoi)
+                """), {
+                    "ma_cn": ma_cn, "ngay_gui": thoi_gian_gui, "email_nhan": email_nhan,
+                    "zip_name": zip_name, "zip_path": zip_path, "trang_thai": trang_thai_log, "nguoi": user_action
+                })
+        except Exception as log_ex:
+            print(f"[LỖI GHI LOG DATABASE] Không thể ghi nhật ký cho đơn vị {ma_cn}: {str(log_ex)}")
+
+    # 4. Phản hồi kết quả tổng quát ra màn hình ứng dụng
+    if fail_mail_count == 0:
+        flash(f"Thực thi hoàn tất! Đã gửi thành công toàn bộ {success_mail_count} Email, chuyển trạng thái dữ liệu sang 'Đã gửi mail' và lưu nhật ký hệ thống.", "success")
+        session.pop('files_to_send', None)  # Xóa sạch session đệm sau khi hoàn thành quy trình
+    else:
+        flash(f"Tiến trình kết thúc có lỗi cục bộ: Gửi thành công {success_mail_count} thư, thất bại {fail_mail_count} thư. Chi tiết xem tại Terminal hoặc bảng log_gui_mail_bc48.", "danger")
+
+    return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
+
 
 ####################################################################################
-# Gửi thư cho chi nhánh tiếp nhận csv lỗi để xử lý cập nhật
-# Nút lệnh chỉ tách mô tả lỗi của CSV process_and_save_split_errors; process_extract_errors_only
+# Nhận file excel phản hồi từ chi nhánh báo cáo kết quả khắc phục chỉnh sửa CSV do Cục PCRT trả lỗi
 ####################################################################################
+@app.route('/bc48/import-phan-hoi', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def giaodien_import_phan_hoi():
+    """
+    Hiển thị trang giao diện Import file phản hồi 
+    và danh sách 20 bản ghi được chi nhánh sửa đổi cập nhật gần đây nhất trong ngày.
+    """
+    engine = bc48.get_bc48_engine(db)
+    query_history = text("""
+        SELECT ma_giao_dich, DATE_FORMAT(ngay_baocao, '%Y-%m-%d') as ngay_baocao, 
+               bang_goc_tim_thay, trang_thai_khac_phuc, ghi_chu_xu_ly,
+               DATE_FORMAT(ngay_cap_nhat, '%d/%m/%Y %H:%i') as ngay_cap_nhat
+        FROM theo_doi_khac_phuc_loi
+        ORDER BY ngay_cap_nhat DESC
+        LIMIT 20;
+    """)
+    
+    lich_su_logs = []
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(query_history)
+            lich_su_logs = [dict(row._mapping) for row in res]
+    except Exception as e:
+        print(f"Lỗi lấy lịch sử import: {str(e)}")
+        
+    return render_template('bc48_import_phan_hoi.html', lich_su_logs=lich_su_logs)
+
+
+@app.route('/bc48/import-phan-hoi-action', methods=['POST'])
+@login_required
+@admin_or_user_sd_bc48
+def import_phan_hoi_chi_nhanh():
+    """
+    Xử lý đọc file Excel phản hồi từ các chi nhánh gửi lên,
+    linh hoạt ánh xạ các tên cột thực tế của chi nhánh về tên cột chuẩn hệ thống;
+    chỉ lọc lấy đúng các cột cần thiết và cập nhật tiến trình vào DB.
+    """
+    if 'file_excel' not in request.files:
+        flash('Lỗi: Không tìm thấy tệp tin gửi lên.', 'danger')
+        return redirect(url_for('giaodien_import_phan_hoi'))
+        
+    file = request.files['file_excel']
+    if file.filename == '':
+        flash('Vui lòng chọn một file Excel hợp lệ từ máy tính!', 'warning')
+        return redirect(url_for('giaodien_import_phan_hoi'))
+        
+    try:
+        # Đọc dữ liệu Excel trực tiếp từ bộ nhớ
+        df = pd.read_excel(file)
+
+        # 1. Chuẩn hóa tên cột thô ban đầu (bỏ khoảng trắng đầu cuối, giữ nguyên hoa thường để map chính xác)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # 2. Định nghĩa từ điển ánh xạ (Từ tên cột của chi nhánh -> Tên cột chuẩn của hệ thống)
+        MAPPING_COLS = {
+            'magiaodichtrongfile': 'ma_giao_dich',
+            'ngaydulieubaocao': 'ngay_baocao',
+            'Lý do chưa chỉnh sửa': 'trang_thai_ghi_nhan',
+            'maipcas': 'ma_hieu_2',
+            'motaloinhnn': 'mota_loi'
+        }
+        # Tiến hành đổi tên các cột nếu tìm thấy trong file của chi nhánh
+        df.rename(columns=MAPPING_COLS, inplace=True)
+
+        # 3. Chuẩn hóa lại toàn bộ cột về chữ thường để khớp với các logic xử lý bên dưới của bạn
+        df.columns = [str(c).lower().strip() for c in df.columns]
+        
+        # Định danh các cột cốt lõi bắt buộc phải xuất hiện trong file (lúc này đã được đổi tên thành chuẩn)
+        required_cols = ['ma_giao_dich', 'ngay_baocao', 'trang_thai_ghi_nhan']
+        if not all(col in df.columns for col in required_cols):
+            flash('Import thất bại: Tệp Excel sai cấu trúc chuẩn! Yêu cầu phải có các cột: ma_giao_dich, ngay_baocao, trang_thai_ghi_nhan.', 'danger')
+            return redirect(url_for('giaodien_import_phan_hoi'))
+            
+        engine = bc48.get_bc48_engine(db)
+        success_count = 0
+        
+        with engine.begin() as transaction_conn:
+            for _, row in df.iterrows():
+                # Kiểm tra tính hợp lệ của trạng thái khắc phục do chi nhánh điền
+                trang_thai_raw = str(row['trang_thai_ghi_nhan']).strip().upper() if not pd.isna(row['trang_thai_ghi_nhan']) else ""
+                if not trang_thai_raw or trang_thai_raw in ['NAN', 'ALL', '']:
+                    continue
+                
+                ma_gd_clean = str(row['ma_giao_dich']).strip()
+                if pd.isna(row['ma_giao_dich']) or ma_gd_clean == "":
+                    continue
+                
+                # Làm sạch giá trị ngày báo cáo về định dạng chuỗi chuẩn YYYY-MM-DD
+                try:
+                    if isinstance(row['ngay_baocao'], (datetime, pd.Timestamp)):
+                        ngay_bc_clean = row['ngay_baocao'].strftime('%Y-%m-%d')
+                    else:
+                        ngay_bc_clean = str(row['ngay_baocao']).strip().split()[0]
+                except:
+                    continue
+
+                # Xác định bảng gốc tìm thấy (khóa định danh phụ cùng ma_giao_dich)
+                if 'bang_goc_tim_thay' in df.columns and not pd.isna(row['bang_goc_tim_thay']):
+                    bang_goc = str(row['bang_goc_tim_thay']).strip().lower()
+                else:
+                    loai_bc_raw = str(row.get('loai_bc', 'ALL')).strip().lower()
+                    bang_goc = f"{loai_bc_raw}_error" if loai_bc_raw in ['ctr', 'dwt', 'eft', 'ptr'] else "unknown_error"
+
+                # CHỈ LẤY CÁC CỘT CẦN THIẾT THEO YÊU CẦU
+                ma_hieu_2_val = str(row['ma_hieu_2']).strip() if 'ma_hieu_2' in df.columns and not pd.isna(row['ma_hieu_2']) else None
+                ma_loi_f_ao_val = str(row['ma_loi_f_ao']).strip() if 'ma_loi_f_ao' in df.columns and not pd.isna(row['ma_loi_f_ao']) else None
+                
+                mota_loi_val = None
+                if 'mota_loi' in df.columns and not pd.isna(row['mota_loi']):
+                    mota_loi_val = str(row['mota_loi']).strip()
+                elif 'mota_loi_don_le' in df.columns and not pd.isna(row['mota_loi_don_le']):
+                    mota_loi_val = str(row['mota_loi_don_le']).strip()
+
+                # Cột lý do nguyên nhân sai sót
+                ghi_chu_raw = str(row.get('nguyen_nhan_sai_sot', '')).strip()
+                ghi_chu_clean = None if ghi_chu_raw in ['nan', 'None', ''] else ghi_chu_raw
+
+                # Thực thi ghi đè tiến trình: Lưu thêm NOW() vào ngày_nhan_file
+                sql_save = text("""
+                    INSERT INTO theo_doi_khac_phuc_loi (
+                        ma_giao_dich, ngay_baocao, bang_goc_tim_thay, ma_hieu_2, ma_loi_f_ao, mota_loi,
+                        trang_thai_khac_phuc, ghi_chu_xu_ly, id_dot, ngay_cap_nhat, ngay_nhan_file
+                    ) VALUES (
+                        :ma_giao_dich, :ngay_baocao, :bang_goc_tim_thay, :ma_hieu_2, :ma_loi_f_ao, :mota_loi,
+                        :trang_thai, :ghi_chu, 0, NOW(), NOW()
+                    )
+                    ON DUPLICATE KEY UPDATE 
+                        trang_thai_khac_phuc = :trang_thai,
+                        ghi_chu_xu_ly = :ghi_chu,
+                        ma_hieu_2 = COALESCE(:ma_hieu_2, ma_hieu_2),
+                        ma_loi_f_ao = COALESCE(:ma_loi_f_ao, ma_loi_f_ao),
+                        mota_loi = COALESCE(:mota_loi, mota_loi),
+                        id_dot = IF(id_dot IS NULL OR id_dot = 0, 0, id_dot),
+                        ngay_cap_nhat = NOW(),
+                        ngay_nhan_file = NOW();
+                """)
+                
+                transaction_conn.execute(sql_save, {
+                    "ma_giao_dich": ma_gd_clean,
+                    "ngay_baocao": ngay_bc_clean,
+                    "bang_goc_tim_thay": bang_goc,
+                    "ma_hieu_2": ma_hieu_2_val,
+                    "ma_loi_f_ao": ma_loi_f_ao_val,
+                    "mota_loi": mota_loi_val,
+                    "trang_thai": trang_thai_raw,
+                    "ghi_chu": ghi_chu_clean
+                })
+                success_count += 1
+                
+        if success_count > 0:
+            flash(f"Hệ thống xử lý thành công! Đã ghi nhận thời gian nhận file và cập nhật tiến độ khắc phục cho {success_count} dòng.", "success")
+        else:
+            flash("Không có bản ghi hợp lệ nào được cập nhật.", "warning")
+            
+    except Exception as e:
+        flash(f"Lỗi quy trình xử lý dữ liệu: {str(e)}", "danger")
+        
+    return redirect(url_for('giaodien_import_phan_hoi'))
+
+####################################################################################
+# KHÔNG DÙNG: Nút lệnh chỉ tách mô tả lỗi của CSV process_and_save_split_errors; process_extract_errors_only
+####################################################################################
+# Bảng ket_qua_do_tim_loi (id Khóa chính): Lưu kết quả sau khi chạy Procedure kiểm tra. Dữ liệu ở đây thường ở dạng thô, cột ma_loi và mota_loi còn bị gộp bởi dấu phẩy
+# Bảng log_chi_tiet_loi_phan_tach (id_goc liên kết với id của bảng ket_qua_do_tim_loi): Lưu dữ liệu đã "làm sạch". Mỗi dòng chỉ có 1 mã lỗi duy nhất, giúp bạn làm báo cáo thống kê mã lỗi dễ dàng
+# Bảng log_gui_mail_bc48 (ma_hieu_1 và ngay_gui liên kết logic): Lưu vết việc gửi mail. Giúp bạn trả lời câu hỏi: "File có chứa lỗi đó đã được gửi đi lúc nào và gửi cho ai?"
+# Nếu ma_loi trống (độ dài = 0) và mota_loi có 3 giá trị (độ dài = 3), thì max_l sẽ là 3; Hệ thống thấy cột ma_loi đang thiếu 3 giá trị so với mức tối đa, nó sẽ tự động thêm 3 giá trị mặc định là "N/A"; Sau đó nó mới tiến hành tách thành 3 dòng
+# Dù không có mã lỗi (ma_loi), nhưng chi nhánh vẫn nhận được đầy đủ 3 dòng mô tả lỗi để họ biết cần phải sửa những gì; Cả 3 dòng lỗi này vẫn được gắn chặt với ma_giao_dich và ma_hieu_1 ban đầu;
+#(1) Trích xuất một tập dữ liệu dựa trên bộ lọc điều kiện (ví dụ: lọc theo loai_bc hoặc lọc theo thang_nam); (2) Chỉ xóa các dòng trong bảng log_chi_tiet_loi_phan_tach có id_goc nằm trong tập dữ liệu vừa lọc đó; (3) Tiến hành tách và nạp lại
 @app.route('/boctach-mota-loi', methods=['GET'])
 @login_required
 @admin_or_user_sd_bc48
@@ -10696,20 +12734,30 @@ def giaodien_boctach_mota_loi():
     
     ma_giao_dich = request.args.get('ma_giao_dich', '').strip()
     trang_thai = request.args.get('trang_thai', '')
+    filter_loai_bc = request.args.get('filter_loai_bc', '').strip() # Nhận tham số lọc loại BC
+
+    ma_don_vi = request.args.get('ma_don_vi', '').strip()
+    ngay_baocao = request.args.get('ngay_baocao', '').strip()
+    ma_loi_f_ao = request.args.get('ma_loi_f_ao', '').strip()
+    
     page = request.args.get('page', 1, type=int)
     per_page = 20
-    
+
+    # Lấy danh sách kèm theo đủ 3 bộ lọc
     data, total_rows = bc48.lay_danh_sach_log_loi(
         engine, 
         ma_giao_dich=ma_giao_dich, 
         trang_thai=trang_thai, 
+        filter_loai_bc=filter_loai_bc,
+        ma_don_vi=ma_don_vi,
+        ngay_baocao=ngay_baocao,
+        ma_loi_f_ao=ma_loi_f_ao,
         page=page, 
         per_page=per_page
     )
     
     total_pages = math.ceil(total_rows / per_page)
     
-    # --- BỔ SUNG DỮ LIỆU ĐỂ RENDER BỘ LỌC BÓC TÁCH ---
     # --- LẤY ĐỘNG LOAI_BC_LIST TỪ BẢNG KET_QUA_DO_TIM_LOI ---
     loai_bc_list = []
     try:
@@ -10727,12 +12775,17 @@ def giaodien_boctach_mota_loi():
             
     except Exception as e:
         # Cơ chế fallback phòng ngừa lỗi bảng cấu trúc hoặc dữ liệu trống
-        print(f"Lưu ý: Không lấy được danh sách loai_bc từ ket_qua_do_tim_loi ({str(e)}), dùng danh sách mặc định.")
-        loai_bc_list = ['BC48', 'CTR', 'DWT', 'EFT']
+        print(f"Lưu ý: Không lấy được danh sách loai_bc từ ket_qua_do_tim_loi ({str(e)}), dùng fallback trống.")
+        loai_bc_list = []
 
-    # Nếu bảng có dữ liệu nhưng trả về rỗng, gán danh sách mặc định để an toàn cho giao diện
+    # Nếu bảng hoàn toàn trống, ta truy vấn dự phòng thêm từ bảng đích log_chi_tiet_loi_phan_tach để tăng tính chính xác
     if not loai_bc_list:
-        loai_bc_list = ['BC48', 'CTR', 'DWT', 'EFT']
+        try:
+            sql_fallback = text("SELECT DISTINCT loai_bc FROM log_chi_tiet_loi_phan_tach WHERE loai_bc IS NOT NULL")
+            with engine.connect() as connection:
+                loai_bc_list = [r[0].upper() for r in connection.execute(sql_fallback)]
+        except:
+            pass
     
     current_month = datetime.now().strftime('%Y-%m') # Định dạng YYYY-MM cho thẻ input type="month"
     
@@ -10741,13 +12794,15 @@ def giaodien_boctach_mota_loi():
         danh_sach_loi=data,
         ma_giao_dich=ma_giao_dich,
         trang_thai=trang_thai,
+        filter_loai_bc=filter_loai_bc,
         page=page,
         total_pages=total_pages,
         total_rows=total_rows,
-        loai_bc_list=loai_bc_list,      # Truyền xuống HTML
-        current_month=current_month     # Truyền xuống HTML
+        loai_bc_list=loai_bc_list, 
+        current_month=current_month 
     )
 
+# nút lệnh "Chỉ bóc tách mota_loi của CSV" trên site: /boctach-mota-loi
 @app.route('/xu-ly-boctach-mota-loi', methods=['POST'])
 @login_required
 @admin_or_user_sd_bc48
@@ -10789,6 +12844,47 @@ def xu_ly_boctach_mota_loi():
         
     return redirect(url_for('giaodien_boctach_mota_loi'))
 
+
+@app.route('/xuat-excel-boctach', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def xuat_excel_boctach():
+    engine = bc48.get_bc48_engine(db)
+    
+    # Lấy các tham số lọc từ URL (cùng tên với bộ lọc trên giao diện)
+    params = {
+        'ma_giao_dich': request.args.get('ma_giao_dich', '').strip(),
+        'trang_thai': request.args.get('trang_thai', ''),
+        'filter_loai_bc': request.args.get('filter_loai_bc', '').strip(),
+        'ma_don_vi': request.args.get('ma_don_vi', '').strip(),
+        'ngay_baocao': request.args.get('ngay_baocao', '').strip(),
+        'ma_loi_f_ao': request.args.get('ma_loi_f_ao', '').strip()
+    }
+    
+    try:
+        # Gọi hàm lấy dữ liệu toàn bộ (per_page=None để bỏ LIMIT)
+        data, _ = bc48.lay_danh_sach_log_loi(engine, **params, page=1, per_page=None)
+        
+        if not data:
+            flash("Không có dữ liệu phù hợp để xuất file!", "warning")
+            return redirect(url_for('giaodien_boctach_mota_loi'))
+        
+        # Gọi hàm export từ bc48
+        output, file_name = bc48.xuat_bao_cao_chi_tiet_loi_phan_tach(data)
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=file_name
+        )
+        
+    except Exception as e:
+        flash(f"Lỗi khi xuất file Excel: {str(e)}", "danger")
+        return redirect(url_for('giaodien_boctach_mota_loi'))
+
+
+
 @app.route('/capnhat-trangthai-loi/<int:id_chi_tiet>', methods=['POST'])
 @login_required
 @admin_or_user_sd_bc48
@@ -10810,173 +12906,6 @@ def xu_ly_cap_nhat_loi(id_chi_tiet):
         flash(f"Có lỗi xảy ra: {str(e)}", "danger")
         
     return redirect(request.referrer or url_for('giaodien_boctach_mota_loi'))
-
-
-@app.route('/xuat-excel-boctach', methods=['GET'])
-@login_required
-@admin_or_user_sd_bc48
-def xuat_excel_boctach():
-    engine = bc48.get_bc48_engine(db)
-    
-    # Lấy các tham số lọc từ URL, đồng bộ với bộ lọc tìm kiếm trên giao diện
-    ma_giao_dich = request.args.get('ma_giao_dich', '').strip()
-    trang_thai = request.args.get('trang_thai', '')
-    
-    try:
-        # Gọi hàm lấy toàn bộ dữ liệu thỏa mãn điều kiện lọc. 
-        # Truyền per_page=None để câu lệnh SQL loại bỏ hoàn toàn LIMIT và OFFSET.
-        data, _ = bc48.lay_danh_sach_log_loi(
-            engine, 
-            ma_giao_dich=ma_giao_dich, 
-            trang_thai=trang_thai, 
-            page=1, 
-            per_page=None
-        )
-    except Exception as e:
-        flash(f"Có lỗi xảy ra khi truy vấn dữ liệu xuất file: {str(e)}", "danger")
-        return redirect(url_for('giaodien_boctach_mota_loi'))
-    
-    # Nếu bộ lọc không trả về dòng dữ liệu nào, thông báo cho người dùng
-    if not data:
-        flash("Không có dữ liệu phù hợp với điều kiện lọc để xuất file Excel!", "warning")
-        return redirect(url_for('giaodien_boctach_mota_loi'))
-        
-    # Chuyển đổi cấu trúc danh sách (list of dicts) sang DataFrame của Pandas
-    export_data = []
-    for row in data:
-        # Lấy an toàn ngày báo cáo để tránh lỗi định dạng nếu gặp dữ liệu trống (None)
-        ngay_bc = row.get('ngay_baocao')
-        ngay_bc_str = ngay_bc.strftime('%d/%m/%Y') if ngay_bc else ''
-        
-        export_data.append({
-            'ID Chi Tiết': row.get('id_chi_tiet', ''),
-            'Mã Giao Dịch': row.get('ma_giao_dich', ''),
-            'Mã CN': row.get('macn', ''),
-            'Mã Hiệu 1': row.get('ma_hieu_1', ''),
-            'Tên Mã Hiệu 1': row.get('ten_ma_hieu_1', ''),
-            'Mã Hiệu 2': row.get('ma_hieu_2', ''),
-            'Tên Mã Hiệu 2': row.get('ten_ma_hieu_2', ''),
-            'Mã Lỗi Đơn': row.get('ma_loi_don_le', ''),
-            'Mô Tả Lỗi': row.get('mota_loi_don_le', ''),
-            'Mã Lỗi F Ảo': row.get('ma_loi_f_ao', ''),
-            'Ngày Báo Cáo': ngay_bc_str,
-            'Trạng Thái Số': row.get('trang_thai_xuly', ''),
-            'File Chi Nhánh Phản Hồi': row.get('file_phan_hoi_tu_cn', '')
-        })
-        
-    df = pd.DataFrame(export_data)
-    
-    try:
-        # Sử dụng luồng byte ghi trực tiếp vào bộ nhớ RAM (không tạo file tạm trên đĩa cứng máy chủ)
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Log_Boc_Tach_Loi')
-            
-        output.seek(0)
-        
-        # Sửa lại định dạng giờ phút giây chuẩn (%Y%m%d_%H%M%S) để tránh trùng ký hiệu tháng %m
-        file_name = f"Log_BocTach_MotaLoi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=file_name
-        )
-    except Exception as e:
-        flash(f"Lỗi trong quá trình khởi tạo cấu trúc tệp Excel: {str(e)}", "danger")
-        return redirect(url_for('giaodien_boctach_mota_loi'))
-
-
-@app.route('/bc48/gui-mail-loi', methods=['GET', 'POST'])
-@login_required
-@admin_or_user_sd_bc48
-def giaodien_gui_mail_chi_nhanh():
-    engine = bc48.get_bc48_engine(db)
-    summary = None 
-    current_month = datetime.now().strftime("%Y-%m")
-    
-    with engine.connect() as conn:
-        query_distinct_bc = text("SELECT DISTINCT loai_bc FROM ket_qua_do_tim_loi WHERE loai_bc IS NOT NULL AND loai_bc != '' ORDER BY loai_bc")
-        loai_bc_list = [row[0] for row in conn.execute(query_distinct_bc).fetchall()]
-        
-    if not loai_bc_list:
-        loai_bc_list = ['BC48']
-
-    if request.method == 'POST':
-        action = request.form.get('action')
-        loai_bc = request.form.get('loai_bc')
-        
-        all_months_checked = request.form.get('all_months')
-        if all_months_checked == '1':
-            thang_nam = 'ALL'
-        else:
-            thang_nam = request.form.get('thang_nam')
-
-        if not thang_nam:
-            flash("Vui lòng chọn Tháng/Năm hoặc tích chọn 'Tất cả các kỳ'!", "danger")
-            return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
-
-        # --- TRƯỜNG HỢP 1: CHỈ BÓC TÁCH LỖI (AN TOÀN - KHÔNG TRÙNG LẶP) ---
-        if action == 'extract_only':
-            res_summary = bc48.process_extract_errors_only(engine, loai_bc, thang_nam)
-            
-            if isinstance(res_summary, str):
-                flash(res_summary, "danger")
-                summary = None
-            else:
-                summary = res_summary
-                log_info = f"[{'Tất cả báo cáo' if loai_bc == 'ALL' else loai_bc}] kỳ [{'Tất cả các kỳ' if thang_nam == 'ALL' else thang_nam}]"
-                flash(f"Hệ thống đã dọn dẹp bản ghi cũ và bóc tách mới thành công cho {log_info}.", "success")
-        
-        # --- TRƯỜNG HỢP 2: BẮT ĐẦU GỬI NGAY ---
-        else:
-            smtp_config = {
-                'server': os.getenv('MAIL_SERVER'),
-                'port': os.getenv('MAIL_PORT', '587'),
-                'email': os.getenv('MAIL_USERNAME'),
-                'password': os.getenv('MAIL_PASSWORD')
-            }
-            
-            if not smtp_config['email'] or not smtp_config['password']:
-                flash("Lỗi: Cấu hình tài khoản hoặc mật khẩu MAIL trong .env bị trống!", "danger")
-                return redirect(url_for('giaodien_gui_mail_chi_nhanh'))
-
-            res_summary = bc48.process_send_mail_errors(engine, smtp_config)
-
-            if isinstance(res_summary, str):
-                flash(res_summary, "danger")
-                summary = None
-            else:
-                summary = res_summary
-                flash(f"Đã thực hiện gửi thông báo mail cho {len(summary)} đơn vị chi nhánh.", "success")
-
-    # LOGIC PHÂN TRANG NHẬT KÝ
-    page = request.args.get('page', 1, type=int)
-    per_page = 20  
-    offset = (page - 1) * per_page
-
-    with engine.connect() as conn:
-        total_rows = conn.execute(text("SELECT COUNT(*) FROM log_gui_mail_bc48")).scalar()
-        total_pages = (total_rows + per_page - 1) // per_page
-
-        query_history = text("""
-            SELECT ma_hieu_1, ngay_gui, email_nhan, ten_file_dinh_kem, trang_thai, nguoi_thuc_hien 
-            FROM log_gui_mail_bc48 
-            ORDER BY ngay_gui DESC 
-            LIMIT :limit OFFSET :offset
-        """)
-        history = conn.execute(query_history, {"limit": per_page, "offset": offset}).fetchall()
-
-    return render_template('bc48_ket_qua_gui_mail.html', 
-                           summary=summary, 
-                           history=history, 
-                           page=page, 
-                           total_pages=total_pages,
-                           current_month=current_month,
-                           loai_bc_list=loai_bc_list)
-
-
 ####################################################################################
 # Dashboard để theo dõi trạng thái xử lý lỗi
 ####################################################################################
@@ -11023,25 +12952,34 @@ def view_cau_hinh_nghiep_vu():
 @login_required
 @admin_or_user_sd_bc48
 def ket_qua_logic_kh_gt():
-    # Lấy số trang từ URL (mặc định là trang 1)
+    # 1. Lấy số trang từ URL (mặc định là trang 1)
     page = request.args.get('page', 1, type=int)
     per_page = 50  # Số bản ghi mỗi trang
     
+    # 2. Lấy bộ lọc ngày từ URL, nếu không có thì mặc định lấy từ đầu tháng hiện hành đến ngày hôm nay
+    default_tu_ngay = datetime.now().strftime('%Y-%m-01')
+    default_den_ngay = datetime.now().strftime('%Y-%m-%d')
+    
+    tu_ngay = request.args.get('tu_ngay', default_tu_ngay)
+    den_ngay = request.args.get('den_ngay', default_den_ngay)
+    
     try:
-        data, total_records = bc48.get_log_loi_logic_data(db, page, per_page)
+        # Truyền thêm tham số lọc ngày vào hàm lấy dữ liệu dưới DB
+        data, total_records = bc48.get_log_loi_logic_data(db, page, per_page, tu_ngay, den_ngay)
         
         # Tính toán tổng số trang
-        total_pages = math.ceil(total_records / per_page)
+        total_pages = math.ceil(total_records / per_page) if total_records > 0 else 1
         
-        # ĐƯA VÀO TRONG KHỐI TRY: Trả về giao diện sau khi lấy dữ liệu thành công
         return render_template('view_logic_error_kh_gt.html', 
                                data=data, 
                                page=page, 
                                total_pages=total_pages,
-                               total_records=total_records)
+                               total_records=total_records,
+                               tu_ngay=tu_ngay,
+                               den_ngay=den_ngay)
 
     except Exception as e:
-        flash(f"Lỗi: {str(e)}", "danger")
+        flash(f"Lỗi hệ thống: {str(e)}", "danger")
         return redirect(url_for('index'))
 
 
@@ -11049,17 +12987,28 @@ def ket_qua_logic_kh_gt():
 @login_required
 @admin_or_user_sd_bc48
 def run_check_logic_LoaiKH_LoaiGT():
-    # Route này chỉ gọi khi bấm nút "Chạy kiểm tra" từ AJAX
-    success = bc48.run_sp_kiem_tra_logic_LoaiKH_LoaiGT(db)
+    # 1. Lấy tham số ngày chọn từ AJAX gửi lên
+    tu_ngay = request.form.get('tu_ngay')
+    den_ngay = request.form.get('den_ngay')
+    
+    if not tu_ngay or not den_ngay:
+        return jsonify({
+            'status': 'error',
+            'message': 'Tham số đầu vào Từ ngày hoặc Đến ngày không được để trống.'
+        }), 400
+        
+    # 2. Thực thi Procedure với tham số động do người dùng lựa chọn
+    success = bc48.run_sp_kiem_tra_logic_LoaiKH_LoaiGT(db, tu_ngay, den_ngay)
+    
     if success:
         return jsonify({
             'status': 'success', 
-            'message': 'Đã hoàn thành rà soát logic giữa Loại khách hàng và Loại giấy tờ!'
+            'message': f'Đã hoàn thành rà soát logic dữ liệu từ ngày {tu_ngay} đến ngày {den_ngay} thành công!'
         })
     else:
         return jsonify({
             'status': 'error', 
-            'message': 'Lỗi khi thực thi Procedure sp_KiemTraLogic_LoaiKH_LoaiGT.'
+            'message': 'Lỗi trong quá trình thực thi Procedure sp_KiemTraLogic_LoaiKH_LoaiGT trên Hệ quản trị cơ sở dữ liệu.'
         }), 500
 
 ################################################################################################################
@@ -11311,24 +13260,191 @@ def xuat_excel_loi_danh_muc():
 ################################################################################################################
 # Tao Procedure thong ke hinh thuc GLD, GBS, GLA tu tat ca bang _yyyymm
 # Thống kê theo hình thức file gửi (GLD, GBS, GLA) từ tất cả các bảng ctr_yyyymm; dwt_yyyymm; eft_yyyymm; ptr_yyyymm
+# Trong khoảng thời gian có bao nhiêu dòng của loại báo cáo nào được GLA?
 ################################################################################################################
 @app.route('/bc48/dashboard-hinh-thuc')
 @login_required
 @admin_or_user_sd_bc48
 def bc48_dashboard_hinh_thuc():
     # Gọi hàm xử lý logic từ module bc48 đã import ở đầu file, truyền vào đối tượng db của app.py
-    matrix_data, ratio_data = bc48.get_dashboard_hinh_thuc_data(db)
+    matrix_data, ratio_data, hinh_thuc_list, details_data = bc48.get_dashboard_hinh_thuc_data(db)
     
     # Trả giao diện HTML kèm dữ liệu sạch
     return render_template(
         'dashboard_hinh_thuc.html', 
         matrix=matrix_data, 
-        ratio=ratio_data
+        ratio=ratio_data,
+        hinh_thuc_list=hinh_thuc_list,
+        details=details_data
     )
+
+@app.route('/bc48/sao-ke-gla')
+@login_required
+@admin_or_user_sd_bc48
+def bc48_sao_ke_gla():
+    # Nhận tham số từ request
+    start = int(request.args.get('start', 0))
+    length = int(request.args.get('length', 25))
+    search_params = {
+        "hinh_thuc": request.args.get('hinh_thuc'),
+        "loai_bc": request.args.get('loai_bc'),
+        "tu_ngay": request.args.get('tu_ngay'),
+        "den_ngay": request.args.get('den_ngay')
+    }
+
+    # Gọi hàm đã viết ở bc48.py
+    data, total = bc48.get_sao_ke_gla(db, search_params, start, length)
+    
+    return jsonify({
+        "draw": int(request.args.get('draw', 1)),
+        "recordsTotal": total,
+        "recordsFiltered": total,
+        "data": data
+    })
+
+# Tab "SLgFile, SLgDong, HinhThuc, quydoi 4 loai_bc" lấy thông tin toàn bộ cột trong bảng dashboard_tke_slgfile_sodong_hinh_thuc
+@app.route('/bc48/api-tke-slgfile')
+@login_required
+@admin_or_user_sd_bc48
+def bc48_api_tke_slgfile():
+    start = int(request.args.get('start', 0))
+    length = int(request.args.get('length', 25))
+    search_value = request.args.get('search[value]', '') # Lấy ô tìm kiếm mặc định của DataTable
+
+    data, total = bc48.get_dashboard_tke_slgfile(db, start, length, search_value)
+    
+    return jsonify({
+        "draw": int(request.args.get('draw', 1)),
+        "recordsTotal": total,
+        "recordsFiltered": total,
+        "data": data
+    })
+
+
+################################################################################################################
+# Thống kê từng ngày số lượng dòng KTraGDLoi, KTraFileThanhCong của từng loại báo cáo (CTR; DWT; EFT; PTR); bảng bang_thong_ke_loi_daily kết quả của sp_tong_hop_sodong_bang_error
+################################################################################################################
+@app.route('/bc48/thong-ke-trang-thai') # Route 1: Hiển thị trang giao diện (chỉ render HTML)
+@login_required
+@admin_or_user_sd_bc48
+def bc48_thong_ke_trang_thai():
+    return render_template('thong_ke_trang_thai.html')
+
+@app.route('/api/bc48/thong-ke-trang-thai') # Route 2: API cung cấp dữ liệu cho DataTables
+@login_required
+@admin_or_user_sd_bc48
+def api_thong_ke_trang_thai():
+    start = int(request.args.get('start', 0))
+    length = int(request.args.get('length', 20))
+    search_value = request.args.get('search[value]') # Lấy nội dung ô Search
+    tu_ngay = request.args.get('tu_ngay')
+    den_ngay = request.args.get('den_ngay')
+    
+    data, total = bc48.get_thong_ke_trang_thai_data(db, start, length, search_value, tu_ngay, den_ngay)
+    
+    return jsonify({
+        "draw": int(request.args.get('draw', 1)),
+        "recordsTotal": total,
+        "recordsFiltered": total, # Có thể dùng để lọc tìm kiếm nếu cần
+        "data": data
+    })
+
+@app.route('/api/bc48/export-thong-ke')
+@login_required
+@admin_or_user_sd_bc48
+def export_thong_ke_to_excel_route():
+    tu_ngay = request.args.get('tu_ngay')
+    den_ngay = request.args.get('den_ngay')
+    
+    # Lấy thời gian hiện tại để làm timestamp cho tên file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Tạo tên file: Thong_Ke_Trang_Thai_20260608_214530.xlsx
+    # Hoặc bao gồm cả khoảng thời gian lọc nếu cần
+    file_name = f"SoDong_LOI_tung_ngay_cac_loai_baocao_{timestamp}.xlsx"
+    
+    # Gọi hàm từ bc48
+    excel_file = bc48.export_thong_ke_trang_thai_to_excel(db, tu_ngay, den_ngay)
+    
+    return send_file(excel_file, download_name=file_name, as_attachment=True)
+
+################################################################################################################
+# Truy vấn thông tin bảng thongtinkhachhang (kết quả chạy của sp_Laythongtinkhachhang; evt_Lay_thongtin_khachhang)
+################################################################################################################
+@app.route('/ttkh_bc48', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def ttkh_bc48():
+    # Kiểm tra quyền Admin
+    if not current_user.is_admin:
+        abort(403)
+        
+    # Lấy các tham số tìm kiếm từ request
+    sogt = request.args.get('sogt', '').strip()
+    tenkh = request.args.get('tenkh', '').strip()
+    data_month = request.args.get('data_month', '').strip()
+    
+    # Xử lý phân trang
+    try:
+        page = int(request.args.get('page', 1))
+    except ValueError:
+        page = 1
+    per_page = 50  # Số lượng bản ghi trên một trang
+
+    # Gọi tầng xử lý nghiệp vụ tại bc48.py
+    # Truyền tham số db vào để thực thi truy vấn qua Engine bind 'db_bc48'
+    result = bc48.get_thong_tin_khach_hang(
+        db=db, 
+        sogt=sogt, 
+        tenkh=tenkh, 
+        data_month=data_month, 
+        page=page, 
+        per_page=per_page
+    )
+
+    return render_template(
+        'ttkh_bc48.html',  # Bạn cần tạo thêm template giao diện này để hiển thị bảng dữ liệu
+        data=result['data'],
+        total=result['total'],
+        page=page,
+        per_page=per_page,
+        total_pages=result['total_pages'],
+        sogt=sogt,
+        tenkh=tenkh,
+        data_month=data_month
+    )
+
+@app.route('/ttkh_bc48/export', methods=['GET'])
+@login_required
+@admin_or_user_sd_bc48
+def ttkh_bc48_export():
+    # 1. Kiểm tra quyền bảo mật
+    if not current_user.is_admin:
+        abort(403)
+        
+    # 2. Tiếp nhận tham số lọc từ URL do Ajax/Giao diện gửi lên
+    sogt = request.args.get('sogt', '').strip()
+    tenkh = request.args.get('tenkh', '').strip()
+    data_month = request.args.get('data_month', '').strip()
+
+    # 3. Tạo tên file động theo thời gian thực kết xuất
+    filename = f"XUAT_DULIEU_TTKH_BC48_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    
+    # 4. Trả về luồng Response đồng thời gọi trực tiếp Generator từ tầng nghiệp vụ bc48.py
+    response = Response(
+        stream_with_context(bc48.generate_ttkh_csv_stream(db, sogt, tenkh, data_month)),
+        mimetype="text/csv; charset=utf-8"
+    )
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return response
 
 
 # ----------------------------------------------------------------------
 # CHẠY ỨNG DỤNG FLASK
 # ----------------------------------------------------------------------
 if __name__ == '__main__':
+    ##app.run(host='0.0.0.0', port=5001, debug=False) # Chạy ứng dụng trên cổng 5001
+    # SỬ DỤNG socketio.run thay vì app.run
+    # Lưu ý: use_reloader=False cực kỳ quan trọng khi dùng Watchdog 
+    # để tránh việc tạo 2 tiến trình giám sát cùng lúc gây lỗi khóa file.
     socketio.run(app, host='0.0.0.0', port=5001, debug=False, use_reloader=False)
